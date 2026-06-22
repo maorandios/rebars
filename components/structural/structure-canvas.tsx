@@ -7,7 +7,10 @@ import { polygonBounds } from "@/lib/geometry/clipping";
 import { generateBaseMeshLayout } from "@/lib/geometry/mesh-sheet-layout";
 import type {
   BaseMeshSettings,
+  CadLineEntity,
+  CadTextEntity,
   MeshSheet,
+  MeshZone,
   Point,
   Polygon,
   SlabGeometry,
@@ -17,6 +20,28 @@ import type {
 
 const canvasPadding = 120;
 const initialScale = 0.08;
+const minimumScale = 0.005;
+const maximumScale = 2;
+const detailOffsetX = 7_000;
+const meshDetailSize = {
+  height: 7_500,
+  width: 8_500
+};
+const cadTextHeight = {
+  detail: 260,
+  label: 220,
+  small: 180,
+  title: 340
+};
+const cadMarkerSize = 220;
+const cadArrowSize = 180;
+const minimumDrawnZoneSize = 500;
+
+type ZoneDraft = {
+  current: Point;
+  isDragging: boolean;
+  start: Point;
+};
 
 function screenPx(value: number, scale: number) {
   return value / scale;
@@ -35,6 +60,50 @@ function drawPolygonPath(context: CanvasRenderingContext2D, polygon: Polygon) {
   }
 
   context.closePath();
+}
+
+function drawPolylinePath(
+  context: CanvasRenderingContext2D,
+  points: Point[],
+  close = false
+) {
+  if (points.length === 0) {
+    return;
+  }
+
+  context.beginPath();
+  context.moveTo(points[0].x, points[0].y);
+
+  for (const point of points.slice(1)) {
+    context.lineTo(point.x, point.y);
+  }
+
+  if (close) {
+    context.closePath();
+  }
+}
+
+function setDraftStroke(
+  context: CanvasRenderingContext2D,
+  scale: number,
+  options: {
+    alpha?: number;
+    color: string;
+    dash?: number[];
+    widthPx: number;
+  }
+) {
+  context.strokeStyle = options.color;
+  context.globalAlpha = options.alpha ?? 1;
+  context.lineWidth = screenPx(options.widthPx, scale);
+  context.setLineDash(
+    options.dash?.map((value) => screenPx(value, scale)) ?? []
+  );
+}
+
+function resetDraftStroke(context: CanvasRenderingContext2D) {
+  context.globalAlpha = 1;
+  context.setLineDash([]);
 }
 
 function polygonCenter(polygon: Polygon): Point {
@@ -57,19 +126,46 @@ function drawText(
     align?: CanvasTextAlign;
     baseline?: CanvasTextBaseline;
     color?: string;
+    height?: number;
     rotation?: number;
-    size?: number;
   } = {}
 ) {
   context.save();
   context.translate(x, y);
   context.rotate(options.rotation ?? 0);
-  context.font = `${screenPx(options.size ?? 11, scale)}px Consolas, "Courier New", monospace`;
+  context.font = `${options.height ?? cadTextHeight.label}px Consolas, "Courier New", monospace`;
   context.fillStyle = options.color ?? "#333333";
   context.textAlign = options.align ?? "center";
   context.textBaseline = options.baseline ?? "middle";
   context.fillText(text, 0, 0);
   context.restore();
+}
+
+function drawCadLine(
+  context: CanvasRenderingContext2D,
+  line: CadLineEntity,
+  scale: number
+) {
+  drawPolylinePath(context, line.points);
+  setDraftStroke(context, scale, {
+    color: line.color ?? "#9b9b9b",
+    dash: line.layer.includes("GRID") ? [8, 8] : undefined,
+    widthPx: line.lineWeightPx ?? 1
+  });
+  context.stroke();
+  resetDraftStroke(context);
+}
+
+function drawCadText(
+  context: CanvasRenderingContext2D,
+  text: CadTextEntity,
+  scale: number
+) {
+  drawText(context, text.text, text.position.x, text.position.y, scale, {
+    color: text.color ?? "#555555",
+    height: text.heightPx ? text.heightPx * 20 : cadTextHeight.small,
+    rotation: text.rotation,
+  });
 }
 
 function drawOpening(
@@ -97,7 +193,33 @@ function drawOpening(
   context.stroke();
 
   const center = polygonCenter(opening.polygon);
-  drawText(context, opening.label, center.x, center.y, scale, { size: 10 });
+  drawText(context, opening.label, center.x, center.y, scale, {
+    height: cadTextHeight.small
+  });
+}
+
+function drawDwgUnderlay(
+  context: CanvasRenderingContext2D,
+  slabGeometry: SlabGeometry,
+  scale: number
+) {
+  if (!slabGeometry.dwgUnderlay) {
+    return;
+  }
+
+  context.save();
+  context.globalAlpha = 0.85;
+
+  for (const line of slabGeometry.dwgUnderlay.lines) {
+    drawCadLine(context, line, scale);
+  }
+
+  for (const text of slabGeometry.dwgUnderlay.texts) {
+    drawCadText(context, text, scale);
+  }
+
+  context.restore();
+  resetDraftStroke(context);
 }
 
 function drawConcreteHatch(
@@ -162,9 +284,9 @@ function drawSlabGeometry(
   scale: number
 ) {
   drawPolygonPath(context, slabGeometry.boundary);
-  context.strokeStyle = "#666666";
-  context.lineWidth = screenPx(1.5, scale);
+  setDraftStroke(context, scale, { color: "#666666", widthPx: 1.5 });
   context.stroke();
+  resetDraftStroke(context);
 
   for (const opening of slabGeometry.openings) {
     drawOpening(context, opening, scale);
@@ -174,24 +296,31 @@ function drawSlabGeometry(
 function drawMeshSheet(
   context: CanvasRenderingContext2D,
   sheet: MeshSheet,
-  scale: number
+  scale: number,
+  opacity = 1
 ) {
   for (const visiblePolygon of sheet.visiblePolygons) {
     drawPolygonPath(context, visiblePolygon);
-    context.strokeStyle = "#00ff00";
-    context.lineWidth = screenPx(1, scale);
+    setDraftStroke(context, scale, {
+      alpha: opacity,
+      color: "#00ff00",
+      widthPx: 1
+    });
     context.stroke();
+    resetDraftStroke(context);
   }
 
   for (const diagonal of sheet.diagonalSegments) {
     context.beginPath();
     context.moveTo(diagonal.start.x, diagonal.start.y);
     context.lineTo(diagonal.end.x, diagonal.end.y);
-    context.strokeStyle = "#00aa00";
-    context.globalAlpha = 0.55;
-    context.lineWidth = screenPx(0.7, scale);
+    setDraftStroke(context, scale, {
+      alpha: 0.55 * opacity,
+      color: "#00aa00",
+      widthPx: 0.7
+    });
     context.stroke();
-    context.globalAlpha = 1;
+    resetDraftStroke(context);
   }
 
   const labelSegment = sheet.diagonalSegments.toSorted(
@@ -204,6 +333,8 @@ function drawMeshSheet(
     return;
   }
 
+  context.save();
+  context.globalAlpha = opacity;
   drawText(
     context,
     `${sheet.length}/${sheet.width}`,
@@ -212,22 +343,35 @@ function drawMeshSheet(
     scale,
     {
       color: "#008000",
+      height: cadTextHeight.small,
       rotation: sheet.orientation === "horizontal" ? 0 : Math.PI / 2,
-      size: 10
     }
   );
+  context.restore();
 }
 
 function drawMeshSheets(
   context: CanvasRenderingContext2D,
   slabGeometry: SlabGeometry,
-  settings: BaseMeshSettings,
+  meshZones: MeshZone[],
+  activeZoneId: string,
   scale: number
 ) {
-  const layout = generateBaseMeshLayout(slabGeometry, settings);
+  for (const [index, zone] of meshZones.entries()) {
+    const exclusionPolygons = meshZones
+      .slice(index + 1)
+      .map((nextZone) => nextZone.geometry);
+    const layout = generateBaseMeshLayout(
+      slabGeometry,
+      zone.parameters,
+      zone.geometry,
+      exclusionPolygons
+    );
+    const opacity = zone.id === activeZoneId ? 1 : 0.45;
 
-  for (const sheet of layout.sheets) {
-    drawMeshSheet(context, sheet, scale);
+    for (const sheet of layout.sheets) {
+      drawMeshSheet(context, sheet, scale, opacity);
+    }
   }
 }
 
@@ -250,7 +394,7 @@ function drawGridOriginMarker(
   scale: number
 ) {
   const origin = gridOriginPoint(slabGeometry, settings);
-  const markerSize = screenPx(9, scale);
+  const markerSize = cadMarkerSize;
 
   context.save();
   context.beginPath();
@@ -262,20 +406,220 @@ function drawGridOriginMarker(
   context.lineWidth = screenPx(1.4, scale);
   context.stroke();
   context.beginPath();
-  context.arc(origin.x, origin.y, screenPx(3, scale), 0, Math.PI * 2);
+  context.arc(origin.x, origin.y, cadMarkerSize / 3, 0, Math.PI * 2);
   context.fillStyle = "#0057ff";
   context.fill();
   drawText(context, "GRID 0,0", origin.x + markerSize * 2, origin.y, scale, {
     align: "left",
     color: "#0057ff",
-    size: 9
+    height: cadTextHeight.small
   });
   context.restore();
+}
+
+function meshDetailOrigin(slabGeometry: SlabGeometry): Point {
+  const bounds = polygonBounds(slabGeometry.boundary);
+
+  return {
+    x: bounds.maxX + detailOffsetX,
+    y: bounds.minY + 1_500
+  };
+}
+
+function drawArrowLine(
+  context: CanvasRenderingContext2D,
+  start: Point,
+  end: Point,
+  scale: number,
+  color = "#333333"
+) {
+  const angle = Math.atan2(end.y - start.y, end.x - start.x);
+  const arrowSize = cadArrowSize;
+
+  drawPolylinePath(context, [start, end]);
+  setDraftStroke(context, scale, { color, widthPx: 1 });
+  context.stroke();
+
+  for (const point of [start, end]) {
+    const direction = point === start ? angle + Math.PI : angle;
+
+    context.beginPath();
+    context.moveTo(point.x, point.y);
+    context.lineTo(
+      point.x - Math.cos(direction - Math.PI / 7) * arrowSize,
+      point.y - Math.sin(direction - Math.PI / 7) * arrowSize
+    );
+    context.moveTo(point.x, point.y);
+    context.lineTo(
+      point.x - Math.cos(direction + Math.PI / 7) * arrowSize,
+      point.y - Math.sin(direction + Math.PI / 7) * arrowSize
+    );
+    context.stroke();
+  }
+
+  resetDraftStroke(context);
+}
+
+function drawMeshDetailCallout(
+  context: CanvasRenderingContext2D,
+  slabGeometry: SlabGeometry,
+  settings: BaseMeshSettings,
+  scale: number
+) {
+  const origin = meshDetailOrigin(slabGeometry);
+  const frame: Polygon = [
+    origin,
+    { x: origin.x + meshDetailSize.width, y: origin.y },
+    {
+      x: origin.x + meshDetailSize.width,
+      y: origin.y + meshDetailSize.height
+    },
+    { x: origin.x, y: origin.y + meshDetailSize.height }
+  ];
+  const boxOrigin = {
+    x: origin.x + 1_250,
+    y: origin.y + 1_500
+  };
+  const boxWidth = 4_800;
+  const boxHeight = 2_800;
+  const meshBox: Polygon = [
+    boxOrigin,
+    { x: boxOrigin.x + boxWidth, y: boxOrigin.y },
+    { x: boxOrigin.x + boxWidth, y: boxOrigin.y + boxHeight },
+    { x: boxOrigin.x, y: boxOrigin.y + boxHeight }
+  ];
+
+  drawPolygonPath(context, frame);
+  setDraftStroke(context, scale, { color: "#111111", widthPx: 1.2 });
+  context.stroke();
+  resetDraftStroke(context);
+
+  drawText(context, "MESH A - רשת א'", origin.x + 450, origin.y + 450, scale, {
+    align: "left",
+    color: "#111111",
+    height: cadTextHeight.title
+  });
+  drawText(
+    context,
+    `BASE MESH Ø${settings.diameter}@${settings.spacing}mm`,
+    origin.x + 450,
+    origin.y + 850,
+    scale,
+    { align: "left", color: "#111111", height: cadTextHeight.label }
+  );
+
+  drawPolygonPath(context, meshBox);
+  setDraftStroke(context, scale, { color: "#00aa00", widthPx: 1.2 });
+  context.stroke();
+
+  for (
+    let x = boxOrigin.x + settings.spacing;
+    x < boxOrigin.x + boxWidth;
+    x += settings.spacing
+  ) {
+    drawPolylinePath(context, [
+      { x, y: boxOrigin.y },
+      { x, y: boxOrigin.y + boxHeight }
+    ]);
+    context.stroke();
+  }
+
+  for (
+    let y = boxOrigin.y + settings.spacing;
+    y < boxOrigin.y + boxHeight;
+    y += settings.spacing
+  ) {
+    drawPolylinePath(context, [
+      { x: boxOrigin.x, y },
+      { x: boxOrigin.x + boxWidth, y }
+    ]);
+    context.stroke();
+  }
+
+  resetDraftStroke(context);
+
+  drawArrowLine(
+    context,
+    { x: boxOrigin.x, y: boxOrigin.y + boxHeight + 700 },
+    { x: boxOrigin.x + boxWidth, y: boxOrigin.y + boxHeight + 700 },
+    scale
+  );
+  drawText(
+    context,
+    `${settings.sheetWidth}mm SHEET WIDTH`,
+    boxOrigin.x + boxWidth / 2,
+    boxOrigin.y + boxHeight + 1_050,
+    scale,
+    { color: "#111111", height: cadTextHeight.label }
+  );
+  drawArrowLine(
+    context,
+    { x: boxOrigin.x + boxWidth + 700, y: boxOrigin.y },
+    { x: boxOrigin.x + boxWidth + 700, y: boxOrigin.y + boxHeight },
+    scale
+  );
+  drawText(
+    context,
+    `${settings.sheetLength}mm SHEET LENGTH`,
+    boxOrigin.x + boxWidth + 1_050,
+    boxOrigin.y + boxHeight / 2,
+    scale,
+    {
+      color: "#111111",
+      height: cadTextHeight.label,
+      rotation: Math.PI / 2
+    }
+  );
+
+  drawText(
+    context,
+    "1:1 MM VECTOR DETAIL | DXF READY",
+    origin.x + 450,
+    origin.y + meshDetailSize.height - 550,
+    scale,
+    { align: "left", color: "#555555", height: cadTextHeight.small }
+  );
+}
+
+function rectangleFromPoints(start: Point, end: Point): Polygon {
+  const minX = Math.min(start.x, end.x);
+  const maxX = Math.max(start.x, end.x);
+  const minY = Math.min(start.y, end.y);
+  const maxY = Math.max(start.y, end.y);
+
+  return [
+    { x: minX, y: minY },
+    { x: maxX, y: minY },
+    { x: maxX, y: maxY },
+    { x: minX, y: maxY }
+  ];
+}
+
+function drawZoneDraft(
+  context: CanvasRenderingContext2D,
+  draft: ZoneDraft | null,
+  scale: number
+) {
+  if (!draft) {
+    return;
+  }
+
+  const polygon = rectangleFromPoints(draft.start, draft.current);
+
+  drawPolygonPath(context, polygon);
+  setDraftStroke(context, scale, {
+    color: "#0057ff",
+    dash: [10, 6],
+    widthPx: 1.5
+  });
+  context.stroke();
+  resetDraftStroke(context);
 }
 
 export function StructureCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const zoneDraftRef = useRef<ZoneDraft | null>(null);
   const hasFitViewRef = useRef(false);
   const panRef = useRef({ x: canvasPadding, y: canvasPadding });
   const scaleRef = useRef(initialScale);
@@ -288,7 +632,15 @@ export function StructureCanvas() {
   });
   const [viewScale, setViewScale] = useState(initialScale);
   const [canvasSize, setCanvasSize] = useState({ height: 1, width: 1 });
-  const { slabGeometry, baseMeshSettings } = useReinforcement();
+  const {
+    slabGeometry,
+    meshZones,
+    activeZoneId,
+    activeMeshZone,
+    isDrawingZone,
+    cancelDrawingZone,
+    commitDrawnMeshZone,
+  } = useReinforcement();
 
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
@@ -309,7 +661,7 @@ export function StructureCanvas() {
         (canvas.width - 80) / (bounds.maxX - bounds.minX),
         (canvas.height - 80) / (bounds.maxY - bounds.minY)
       );
-      const nextScale = Math.max(0.025, Math.min(0.24, fitScale));
+      const nextScale = Math.max(minimumScale, Math.min(0.18, fitScale));
 
       scaleRef.current = nextScale;
       panRef.current = {
@@ -332,16 +684,30 @@ export function StructureCanvas() {
       panRef.current.x,
       panRef.current.y
     );
+    drawDwgUnderlay(context, slabGeometry, scaleRef.current);
     drawStructuralBackground(context, slabGeometry, scaleRef.current);
-    drawMeshSheets(context, slabGeometry, baseMeshSettings, scaleRef.current);
+    drawMeshSheets(
+      context,
+      slabGeometry,
+      meshZones,
+      activeZoneId,
+      scaleRef.current
+    );
     drawSlabGeometry(context, slabGeometry, scaleRef.current);
-      drawGridOriginMarker(
-        context,
-        slabGeometry,
-        baseMeshSettings,
-        scaleRef.current
-      );
-  }, [baseMeshSettings, slabGeometry]);
+    drawGridOriginMarker(
+      context,
+      slabGeometry,
+      activeMeshZone.parameters,
+      scaleRef.current
+    );
+    drawMeshDetailCallout(
+      context,
+      slabGeometry,
+      activeMeshZone.parameters,
+      scaleRef.current
+    );
+    drawZoneDraft(context, zoneDraftRef.current, scaleRef.current);
+  }, [activeMeshZone.parameters, activeZoneId, meshZones, slabGeometry]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -376,6 +742,17 @@ export function StructureCanvas() {
       return;
     }
 
+    const eventToWorldPoint = (event: PointerEvent): Point => {
+      const rect = container.getBoundingClientRect();
+      const localX = event.clientX - rect.left;
+      const localY = event.clientY - rect.top;
+
+      return {
+        x: (localX - panRef.current.x) / scaleRef.current,
+        y: (localY - panRef.current.y) / scaleRef.current
+      };
+    };
+
     const handleWheel = (event: WheelEvent) => {
       event.preventDefault();
 
@@ -387,8 +764,11 @@ export function StructureCanvas() {
         y: (localY - panRef.current.y) / scaleRef.current
       };
       const nextScale = Math.max(
-        0.025,
-        Math.min(0.24, scaleRef.current * (event.deltaY > 0 ? 0.9 : 1.1))
+        minimumScale,
+        Math.min(
+          maximumScale,
+          scaleRef.current * (event.deltaY > 0 ? 0.9 : 1.1)
+        )
       );
 
       scaleRef.current = nextScale;
@@ -401,17 +781,60 @@ export function StructureCanvas() {
     };
 
     const handlePointerDown = (event: PointerEvent) => {
-      container.setPointerCapture(event.pointerId);
-      dragRef.current = {
-        isDragging: true,
-        startX: event.clientX,
-        startY: event.clientY,
-        panX: panRef.current.x,
-        panY: panRef.current.y
-      };
+      if (event.button === 2) {
+        event.preventDefault();
+
+        try {
+          container.setPointerCapture(event.pointerId);
+        } catch {
+          // Synthetic/test pointer events may not have an active pointer capture.
+        }
+
+        dragRef.current = {
+          isDragging: true,
+          startX: event.clientX,
+          startY: event.clientY,
+          panX: panRef.current.x,
+          panY: panRef.current.y
+        };
+        return;
+      }
+
+      if (isDrawingZone) {
+        if (event.button !== 0) {
+          return;
+        }
+
+        try {
+          container.setPointerCapture(event.pointerId);
+        } catch {
+          // Synthetic/test pointer events may not have an active pointer capture.
+        }
+
+        const worldPoint = eventToWorldPoint(event);
+
+        zoneDraftRef.current = {
+          current: worldPoint,
+          isDragging: true,
+          start: worldPoint
+        };
+        renderCanvas();
+        return;
+      }
+
+      // Left click is reserved for future picking; zone selection stays sidebar-only.
     };
 
     const handlePointerMove = (event: PointerEvent) => {
+      if (isDrawingZone && zoneDraftRef.current?.isDragging) {
+        zoneDraftRef.current = {
+          ...zoneDraftRef.current,
+          current: eventToWorldPoint(event)
+        };
+        renderCanvas();
+        return;
+      }
+
       if (!dragRef.current.isDragging) {
         return;
       }
@@ -424,15 +847,46 @@ export function StructureCanvas() {
     };
 
     const handlePointerUp = (event: PointerEvent) => {
+      if (isDrawingZone && zoneDraftRef.current?.isDragging) {
+        const draft = zoneDraftRef.current;
+        const width = Math.abs(draft.current.x - draft.start.x);
+        const height = Math.abs(draft.current.y - draft.start.y);
+
+        zoneDraftRef.current = null;
+
+        if (width >= minimumDrawnZoneSize && height >= minimumDrawnZoneSize) {
+          commitDrawnMeshZone(rectangleFromPoints(draft.start, draft.current));
+        } else {
+          cancelDrawingZone();
+        }
+
+        renderCanvas();
+        try {
+          container.releasePointerCapture(event.pointerId);
+        } catch {
+          // Pointer capture may not exist for synthetic/test events.
+        }
+        return;
+      }
+
       if (!dragRef.current.isDragging) {
         return;
       }
 
-      container.releasePointerCapture(event.pointerId);
+      try {
+        container.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture may not exist for synthetic/test events.
+      }
       dragRef.current.isDragging = false;
     };
 
+    const handleContextMenu = (event: MouseEvent) => {
+      event.preventDefault();
+    };
+
     container.addEventListener("wheel", handleWheel, { passive: false });
+    container.addEventListener("contextmenu", handleContextMenu);
     container.addEventListener("pointerdown", handlePointerDown);
     container.addEventListener("pointermove", handlePointerMove);
     container.addEventListener("pointerup", handlePointerUp);
@@ -440,16 +894,28 @@ export function StructureCanvas() {
 
     return () => {
       container.removeEventListener("wheel", handleWheel);
+      container.removeEventListener("contextmenu", handleContextMenu);
       container.removeEventListener("pointerdown", handlePointerDown);
       container.removeEventListener("pointermove", handlePointerMove);
       container.removeEventListener("pointerup", handlePointerUp);
       container.removeEventListener("pointercancel", handlePointerUp);
     };
-  }, [renderCanvas]);
+  }, [
+    cancelDrawingZone,
+    commitDrawnMeshZone,
+    isDrawingZone,
+    meshZones,
+    renderCanvas
+  ]);
 
   return (
     <div className="relative h-full min-h-[620px] overflow-hidden rounded-xl border bg-white">
-      <div ref={containerRef} className="h-full w-full touch-none cursor-grab">
+      <div
+        ref={containerRef}
+        className={`h-full w-full touch-none ${
+          isDrawingZone ? "cursor-crosshair" : "cursor-default"
+        }`}
+      >
         <canvas
           ref={canvasRef}
           className="block h-full w-full"
@@ -458,9 +924,14 @@ export function StructureCanvas() {
         />
       </div>
       <div className="pointer-events-none absolute left-4 top-4 rounded-md border bg-white/90 px-3 py-2 text-xs text-muted-foreground shadow-sm">
-        Slab geometry engine | mouse wheel zoom | drag pan | sheet layout clips
-        at boundary and openings
+        CAD viewport | mm model-space drawing | zoom camera only | DWG
+        underlay + mesh layout + detail callouts
       </div>
+      {isDrawingZone ? (
+        <div className="pointer-events-none absolute left-1/2 top-20 max-w-md -translate-x-1/2 rounded-md border border-blue-200 bg-blue-50 px-4 py-2 text-sm font-medium text-blue-900 shadow-sm">
+          לחץ וגרור עם העכבר כדי להגדיר את שטח הרשת החדשה
+        </div>
+      ) : null}
     </div>
   );
 }

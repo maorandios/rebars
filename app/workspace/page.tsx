@@ -9,9 +9,15 @@ import { Button } from "@/components/ui/button";
 
 export default function WorkspacePage() {
   return (
-    <main className="min-h-screen bg-background">
-      <section className="mx-auto flex min-h-screen w-full max-w-[1600px] flex-col gap-5 px-6 py-6">
-        <header className="flex flex-col gap-4 rounded-xl border bg-card p-5 shadow-sm md:flex-row md:items-center md:justify-between">
+    <main className="min-h-screen bg-background" suppressHydrationWarning>
+      <section
+        className="mx-auto flex min-h-screen w-full max-w-[1600px] flex-col gap-5 px-6 py-6"
+        suppressHydrationWarning
+      >
+        <header
+          className="flex flex-col gap-4 rounded-xl border bg-card p-5 shadow-sm md:flex-row md:items-center md:justify-between"
+          suppressHydrationWarning
+        >
           <div>
             <div className="text-sm text-muted-foreground">
               Phase 1 MVP | Slab geometry workspace

@@ -1,5 +1,7 @@
 import type {
   BaseMeshSettings,
+  DwgUnderlay,
+  MeshZone,
   Polygon,
   SlabGeometry,
   StructuralElement
@@ -172,6 +174,125 @@ const columns: StructuralElement[] = [
   }
 ];
 
+const mockDwgUnderlay: DwgUnderlay = {
+  lines: [
+    {
+      id: "DWG-GRID-X-01",
+      layer: "A-GRID",
+      color: "#b8b8b8",
+      lineWeightPx: 0.8,
+      points: [
+        { x: 0, y: 4_000 },
+        { x: 30_000, y: 4_000 }
+      ]
+    },
+    {
+      id: "DWG-GRID-X-02",
+      layer: "A-GRID",
+      color: "#b8b8b8",
+      lineWeightPx: 0.8,
+      points: [
+        { x: 0, y: 8_500 },
+        { x: 30_000, y: 8_500 }
+      ]
+    },
+    {
+      id: "DWG-GRID-X-03",
+      layer: "A-GRID",
+      color: "#b8b8b8",
+      lineWeightPx: 0.8,
+      points: [
+        { x: 0, y: 13_000 },
+        { x: 30_000, y: 13_000 }
+      ]
+    },
+    {
+      id: "DWG-GRID-Y-01",
+      layer: "A-GRID",
+      color: "#b8b8b8",
+      lineWeightPx: 0.8,
+      points: [
+        { x: 5_000, y: 0 },
+        { x: 5_000, y: 17_000 }
+      ]
+    },
+    {
+      id: "DWG-GRID-Y-02",
+      layer: "A-GRID",
+      color: "#b8b8b8",
+      lineWeightPx: 0.8,
+      points: [
+        { x: 10_000, y: 0 },
+        { x: 10_000, y: 17_000 }
+      ]
+    },
+    {
+      id: "DWG-GRID-Y-03",
+      layer: "A-GRID",
+      color: "#b8b8b8",
+      lineWeightPx: 0.8,
+      points: [
+        { x: 15_000, y: 0 },
+        { x: 15_000, y: 17_000 }
+      ]
+    },
+    {
+      id: "DWG-GRID-Y-04",
+      layer: "A-GRID",
+      color: "#b8b8b8",
+      lineWeightPx: 0.8,
+      points: [
+        { x: 20_000, y: 0 },
+        { x: 20_000, y: 17_000 }
+      ]
+    },
+    {
+      id: "DWG-GRID-Y-05",
+      layer: "A-GRID",
+      color: "#b8b8b8",
+      lineWeightPx: 0.8,
+      points: [
+        { x: 25_000, y: 0 },
+        { x: 25_000, y: 17_000 }
+      ]
+    }
+  ],
+  texts: [
+    {
+      id: "DWG-TITLE",
+      layer: "A-ANNO",
+      color: "#777777",
+      heightPx: 11,
+      position: { x: 1_200, y: -700 },
+      text: "DWG UNDERLAY - ARCHITECTURAL GRID"
+    },
+    {
+      id: "DWG-GRID-LABEL-A",
+      layer: "A-ANNO",
+      color: "#777777",
+      heightPx: 10,
+      position: { x: 5_000, y: -300 },
+      text: "A"
+    },
+    {
+      id: "DWG-GRID-LABEL-B",
+      layer: "A-ANNO",
+      color: "#777777",
+      heightPx: 10,
+      position: { x: 10_000, y: -300 },
+      text: "B"
+    },
+    {
+      id: "DWG-GRID-LABEL-C",
+      layer: "A-ANNO",
+      color: "#777777",
+      heightPx: 10,
+      position: { x: 15_000, y: -300 },
+      text: "C"
+    }
+  ]
+};
+
 export const mockSlabGeometry: SlabGeometry = {
   concreteCover: 30,
   boundary: [
@@ -227,7 +348,8 @@ export const mockSlabGeometry: SlabGeometry = {
     ...coreWalls("CW-ELEV", "Elevator Core", elevatorOpening, 250),
     ...coreWalls("CW-STAIR", "Stair Core", stairOpening, 250),
     ...columns
-  ]
+  ],
+  dwgUnderlay: mockDwgUnderlay
 };
 
 export const mockBaseMeshSettings: BaseMeshSettings = {
@@ -244,6 +366,16 @@ export const mockBaseMeshSettings: BaseMeshSettings = {
   wallAnchorageDepth: 200
 };
 
+export const mockMeshZones: MeshZone[] = [
+  {
+    id: "ZONE-MAIN",
+    name: "אזור ראשי",
+    isMainZone: true,
+    geometry: mockSlabGeometry.boundary,
+    parameters: mockBaseMeshSettings
+  }
+];
+
 export const mockStructureData = {
   metadata: {
     projectName: "Realistic 30m Structural Slab",
@@ -251,5 +383,6 @@ export const mockStructureData = {
     units: "mm"
   },
   slabGeometry: mockSlabGeometry,
-  baseMeshSettings: mockBaseMeshSettings
+  meshZones: mockMeshZones,
+  activeZoneId: mockMeshZones[0].id
 };

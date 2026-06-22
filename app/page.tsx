@@ -73,8 +73,9 @@ function downloadJson(filename: string, data: unknown) {
 export default function DashboardPage() {
   const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const [loadedFiles, setLoadedFiles] = useState<Record<string, string>>({});
-  const { slabGeometry, baseMeshSettings, resetToMockData, exportConfiguration } =
+  const { slabGeometry, activeMeshZone, meshZones, resetToMockData, exportConfiguration } =
     useReinforcement();
+  const activeSettings = activeMeshZone.parameters;
 
   const handleMockUpload = (slotId: string, filename: string) => {
     resetToMockData();
@@ -221,9 +222,10 @@ export default function DashboardPage() {
               <Separator />
 
               <div className="rounded-md border bg-muted/30 p-3 text-xs leading-5 text-muted-foreground">
-                Base mesh: Ø{baseMeshSettings.diameter}@
-                {baseMeshSettings.spacing} | Sheet{" "}
-                {baseMeshSettings.sheetWidth} x {baseMeshSettings.sheetLength}
+                Mesh zones: {meshZones.length} | Active: {activeMeshZone.name}
+                <br />
+                Base mesh: Ø{activeSettings.diameter}@{activeSettings.spacing} |
+                Sheet {activeSettings.sheetWidth} x {activeSettings.sheetLength}
                 mm | Cover {slabGeometry.concreteCover}mm
               </div>
 

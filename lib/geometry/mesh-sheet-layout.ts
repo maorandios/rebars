@@ -440,15 +440,20 @@ export function generateSheetCandidates(
 export function clipSheetToSlab(
   candidate: SheetCandidate,
   slabGeometry: SlabGeometry,
-  settings: BaseMeshSettings
+  settings: BaseMeshSettings,
+  zoneGeometry?: Polygon,
+  exclusionPolygons: Polygon[] = []
 ) {
   const placementBoundary = getMeshPlacementBoundary(slabGeometry, settings);
   const insideSlab = intersectPolygons(candidate.polygon, placementBoundary);
+  const insideZone = zoneGeometry
+    ? insideSlab.flatMap((fragment) => intersectPolygons(fragment, zoneGeometry))
+    : insideSlab;
 
-  return insideSlab.flatMap((fragment) =>
+  return insideZone.flatMap((fragment) =>
     subtractPolygons(
       fragment,
-      getOpeningExclusionPolygons(slabGeometry, settings)
+      [...getOpeningExclusionPolygons(slabGeometry, settings), ...exclusionPolygons]
     )
   );
 }
@@ -467,23 +472,39 @@ function isSheetCut(candidate: SheetCandidate, visiblePolygons: Polygon[]) {
 
 export function generateBaseMeshLayout(
   slabGeometry: SlabGeometry,
-  settings: BaseMeshSettings
+  settings: BaseMeshSettings,
+  zoneGeometry?: Polygon,
+  exclusionPolygons: Polygon[] = []
 ): MeshSheetLayoutResult {
-  return generateLayoutForOrientation(slabGeometry, settings);
+  return generateLayoutForOrientation(
+    slabGeometry,
+    settings,
+    zoneGeometry,
+    exclusionPolygons
+  );
 }
 
 export function compareBaseMeshOrientations(
   slabGeometry: SlabGeometry,
-  settings: BaseMeshSettings
+  settings: BaseMeshSettings,
+  zoneGeometry?: Polygon
 ): BaseMeshOrientationComparison {
-  const horizontal = generateLayoutForOrientation(slabGeometry, {
-    ...settings,
-    orientation: "horizontal"
-  });
-  const vertical = generateLayoutForOrientation(slabGeometry, {
-    ...settings,
-    orientation: "vertical"
-  });
+  const horizontal = generateLayoutForOrientation(
+    slabGeometry,
+    {
+      ...settings,
+      orientation: "horizontal"
+    },
+    zoneGeometry
+  );
+  const vertical = generateLayoutForOrientation(
+    slabGeometry,
+    {
+      ...settings,
+      orientation: "vertical"
+    },
+    zoneGeometry
+  );
 
   const recommended =
     vertical.cutWasteArea < horizontal.cutWasteArea ||
@@ -505,12 +526,17 @@ export function compareBaseMeshOrientations(
 
 function generateLayoutForOrientation(
   slabGeometry: SlabGeometry,
-  settings: ActiveLayoutSettings
+  settings: ActiveLayoutSettings,
+  zoneGeometry?: Polygon,
+  exclusionPolygons: Polygon[] = []
 ): MeshSheetLayoutResult {
   const placementBoundary = getMeshPlacementBoundary(slabGeometry, settings);
+  const layoutBoundary = zoneGeometry
+    ? intersectPolygons(placementBoundary, zoneGeometry)[0] ?? placementBoundary
+    : placementBoundary;
   const originBoundary = getGridOriginBoundary(slabGeometry);
   const candidateLayout = generateSheetCandidates(
-    polygonBounds(placementBoundary),
+    polygonBounds(layoutBoundary),
     polygonBounds(originBoundary),
     settings
   );
@@ -518,7 +544,13 @@ function generateLayoutForOrientation(
   let discardedCount = 0;
   let visibleArea = 0;
   const sheets = candidateLayout.candidates.flatMap<MeshSheet>((candidate) => {
-    const visiblePolygons = clipSheetToSlab(candidate, slabGeometry, settings);
+    const visiblePolygons = clipSheetToSlab(
+      candidate,
+      slabGeometry,
+      settings,
+      zoneGeometry,
+      exclusionPolygons
+    );
 
     if (visiblePolygons.length === 0) {
       discardedCount += 1;

@@ -9,22 +9,29 @@ import {
   type ReactNode
 } from "react";
 
-import {
-  mockBaseMeshSettings,
-  mockSlabGeometry
-} from "@/data/mockStructureData";
+import { mockMeshZones, mockSlabGeometry } from "@/data/mockStructureData";
 import { compareBaseMeshOrientations } from "@/lib/geometry/mesh-sheet-layout";
 import type {
   BaseMeshSettings,
   BaseMeshSettingsUpdate,
   ExportedReinforcementConfiguration,
+  MeshZone,
+  MeshZoneUpdate,
   SlabGeometry
 } from "@/types/structure";
 
 type ReinforcementContextValue = {
   slabGeometry: SlabGeometry;
-  baseMeshSettings: BaseMeshSettings;
-  updateBaseMeshSettings: (patch: BaseMeshSettingsUpdate) => void;
+  meshZones: MeshZone[];
+  activeZoneId: string;
+  activeMeshZone: MeshZone;
+  isDrawingZone: boolean;
+  beginDrawingZone: () => void;
+  cancelDrawingZone: () => void;
+  commitDrawnMeshZone: (geometry: MeshZone["geometry"]) => void;
+  setActiveZoneId: (zoneId: string) => void;
+  updateActiveMeshZone: (patch: MeshZoneUpdate) => void;
+  updateActiveMeshZoneParameters: (patch: BaseMeshSettingsUpdate) => void;
   resetToMockData: () => void;
   exportConfiguration: () => ExportedReinforcementConfiguration;
 };
@@ -37,8 +44,8 @@ function cloneSlabGeometry() {
   return structuredClone(mockSlabGeometry);
 }
 
-function cloneBaseMeshSettings() {
-  return structuredClone(mockBaseMeshSettings);
+function cloneMeshZones() {
+  return structuredClone(mockMeshZones);
 }
 
 function withRecommendedOrientation(
@@ -52,37 +59,121 @@ function withRecommendedOrientation(
   };
 }
 
+function withRecommendedZoneOrientation(
+  slabGeometry: SlabGeometry,
+  zone: MeshZone
+): MeshZone {
+  return {
+    ...zone,
+    parameters: withRecommendedOrientation(slabGeometry, zone.parameters)
+  };
+}
+
+function createDrawnZone(
+  slabGeometry: SlabGeometry,
+  index: number,
+  geometry: MeshZone["geometry"],
+  baseParameters: BaseMeshSettings
+): MeshZone {
+  return withRecommendedZoneOrientation(slabGeometry, {
+    id: `ZONE-${String(index + 1).padStart(2, "0")}`,
+    name: `אזור מחוזק ${index}`,
+    isMainZone: false,
+    geometry,
+    parameters: {
+      ...baseParameters,
+      diameter: 12,
+      gridOffsetX: 0,
+      gridOffsetY: 0
+    }
+  });
+}
+
 export function ReinforcementProvider({ children }: { children: ReactNode }) {
   const [slabGeometry, setSlabGeometry] = useState<SlabGeometry>(() =>
     cloneSlabGeometry()
   );
-  const [baseMeshSettings, setBaseMeshSettings] =
-    useState<BaseMeshSettings>(() =>
-      withRecommendedOrientation(cloneSlabGeometry(), cloneBaseMeshSettings())
-    );
+  const [meshZones, setMeshZones] = useState<MeshZone[]>(() =>
+    cloneMeshZones().map((zone) =>
+      withRecommendedZoneOrientation(cloneSlabGeometry(), zone)
+    )
+  );
+  const [activeZoneId, setActiveZoneId] = useState(() => cloneMeshZones()[0].id);
+  const [isDrawingZone, setIsDrawingZone] = useState(false);
+  const activeMeshZone =
+    meshZones.find((zone) => zone.id === activeZoneId) ?? meshZones[0];
 
-  const updateBaseMeshSettings = useCallback(
-    (patch: BaseMeshSettingsUpdate) => {
-      setBaseMeshSettings((current) => {
-        const nextSettings = { ...current, ...patch };
+  const updateActiveMeshZone = useCallback(
+    (patch: MeshZoneUpdate) => {
+      setMeshZones((current) =>
+        current.map((zone) => {
+          if (zone.id !== activeZoneId) {
+            return zone;
+          }
 
-        if ("orientation" in patch) {
-          return nextSettings;
-        }
+          const nextZone = {
+            ...zone,
+            ...patch,
+            parameters: {
+              ...zone.parameters,
+              ...patch.parameters
+            }
+          };
 
-        return withRecommendedOrientation(slabGeometry, nextSettings);
-      });
+          if (patch.parameters && !("orientation" in patch.parameters)) {
+            return withRecommendedZoneOrientation(slabGeometry, nextZone);
+          }
+
+          return nextZone;
+        })
+      );
     },
-    [slabGeometry]
+    [activeZoneId, slabGeometry]
+  );
+
+  const updateActiveMeshZoneParameters = useCallback(
+    (patch: BaseMeshSettingsUpdate) => {
+      updateActiveMeshZone({ parameters: patch });
+    },
+    [updateActiveMeshZone]
+  );
+
+  const beginDrawingZone = useCallback(() => {
+    setIsDrawingZone(true);
+  }, []);
+
+  const cancelDrawingZone = useCallback(() => {
+    setIsDrawingZone(false);
+  }, []);
+
+  const commitDrawnMeshZone = useCallback(
+    (geometry: MeshZone["geometry"]) => {
+      setMeshZones((current) => {
+        const nextZone = createDrawnZone(
+          slabGeometry,
+          current.length,
+          geometry,
+          activeMeshZone.parameters
+        );
+
+        setActiveZoneId(nextZone.id);
+        return [...current, nextZone];
+      });
+      setIsDrawingZone(false);
+    },
+    [activeMeshZone.parameters, slabGeometry]
   );
 
   const resetToMockData = useCallback(() => {
     const nextSlabGeometry = cloneSlabGeometry();
+    const nextZones = cloneMeshZones().map((zone) =>
+      withRecommendedZoneOrientation(nextSlabGeometry, zone)
+    );
 
     setSlabGeometry(nextSlabGeometry);
-    setBaseMeshSettings(
-      withRecommendedOrientation(nextSlabGeometry, cloneBaseMeshSettings())
-    );
+    setMeshZones(nextZones);
+    setActiveZoneId(nextZones[0].id);
+    setIsDrawingZone(false);
   }, []);
 
   const exportConfiguration = useCallback(
@@ -90,23 +181,39 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       exportedAt: new Date().toISOString(),
       standard: "IS-466" as const,
       slabGeometry,
-      baseMeshSettings
+      meshZones,
+      activeZoneId
     }),
-    [baseMeshSettings, slabGeometry]
+    [activeZoneId, meshZones, slabGeometry]
   );
 
   const value = useMemo(
     () => ({
       slabGeometry,
-      baseMeshSettings,
-      updateBaseMeshSettings,
+      meshZones,
+      activeZoneId,
+      activeMeshZone,
+      isDrawingZone,
+      beginDrawingZone,
+      cancelDrawingZone,
+      commitDrawnMeshZone,
+      setActiveZoneId,
+      updateActiveMeshZone,
+      updateActiveMeshZoneParameters,
       resetToMockData,
       exportConfiguration
     }),
     [
       slabGeometry,
-      baseMeshSettings,
-      updateBaseMeshSettings,
+      meshZones,
+      activeZoneId,
+      activeMeshZone,
+      isDrawingZone,
+      beginDrawingZone,
+      cancelDrawingZone,
+      commitDrawnMeshZone,
+      updateActiveMeshZone,
+      updateActiveMeshZoneParameters,
       resetToMockData,
       exportConfiguration
     ]

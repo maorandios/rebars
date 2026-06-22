@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Grid3X3, RotateCcw } from "lucide-react";
+import { Grid3X3, Plus, RotateCcw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -43,6 +43,11 @@ type NumericDraftValues = {
   wallAnchorageDepth: string;
 };
 
+type NumericDraftState = {
+  zoneId: string;
+  values: NumericDraftValues;
+};
+
 function createDraftValues(settings: BaseMeshSettings): NumericDraftValues {
   return {
     sheetWidth: String(settings.sheetWidth),
@@ -66,26 +71,45 @@ function squareMeters(value: number) {
 export function BaseMeshPanel() {
   const {
     slabGeometry,
-    baseMeshSettings,
-    updateBaseMeshSettings,
+    meshZones,
+    activeZoneId,
+    activeMeshZone,
+    isDrawingZone,
+    beginDrawingZone,
+    setActiveZoneId,
+    updateActiveMeshZoneParameters,
     resetToMockData
   } = useReinforcement();
-  const [numericDraft, setNumericDraft] = useState<NumericDraftValues>(() =>
-    createDraftValues(baseMeshSettings)
+  const activeSettings = activeMeshZone.parameters;
+  const [numericDraft, setNumericDraft] = useState<NumericDraftState>(() =>
+    ({
+      zoneId: activeZoneId,
+      values: createDraftValues(activeSettings)
+    })
   );
+  const visibleDraft =
+    numericDraft.zoneId === activeZoneId
+      ? numericDraft.values
+      : createDraftValues(activeSettings);
+
   const activeWidth =
-    baseMeshSettings.orientation === "horizontal"
-      ? baseMeshSettings.sheetWidth
-      : baseMeshSettings.sheetLength;
+    activeSettings.orientation === "horizontal"
+      ? activeSettings.sheetWidth
+      : activeSettings.sheetLength;
   const activeLength =
-    baseMeshSettings.orientation === "horizontal"
-      ? baseMeshSettings.sheetLength
-      : baseMeshSettings.sheetWidth;
-  const stepX = activeWidth - baseMeshSettings.overlapX;
-  const stepY = activeLength - baseMeshSettings.overlapY;
+    activeSettings.orientation === "horizontal"
+      ? activeSettings.sheetLength
+      : activeSettings.sheetWidth;
+  const stepX = activeWidth - activeSettings.overlapX;
+  const stepY = activeLength - activeSettings.overlapY;
   const layoutComparison = useMemo(
-    () => compareBaseMeshOrientations(slabGeometry, baseMeshSettings),
-    [baseMeshSettings, slabGeometry]
+    () =>
+      compareBaseMeshOrientations(
+        slabGeometry,
+        activeSettings,
+        activeMeshZone.geometry
+      ),
+    [activeMeshZone.geometry, activeSettings, slabGeometry]
   );
   const activeLayout = layoutComparison.active;
   const recommendedLayout = layoutComparison.recommended;
@@ -102,47 +126,61 @@ export function BaseMeshPanel() {
         ? 100
         : 0;
   const isManualLessEconomical =
-    baseMeshSettings.orientation !== layoutComparison.recommendedOrientation &&
+    activeSettings.orientation !== layoutComparison.recommendedOrientation &&
     activeLayout.cutWasteArea > recommendedLayout.cutWasteArea;
   const hasPendingNumericChanges =
-    numericDraft.sheetWidth !== String(baseMeshSettings.sheetWidth) ||
-    numericDraft.sheetLength !== String(baseMeshSettings.sheetLength) ||
-    numericDraft.overlapX !== String(baseMeshSettings.overlapX) ||
-    numericDraft.overlapY !== String(baseMeshSettings.overlapY) ||
-    numericDraft.wallAnchorageDepth !==
-      String(baseMeshSettings.wallAnchorageDepth);
+    visibleDraft.sheetWidth !== String(activeSettings.sheetWidth) ||
+    visibleDraft.sheetLength !== String(activeSettings.sheetLength) ||
+    visibleDraft.overlapX !== String(activeSettings.overlapX) ||
+    visibleDraft.overlapY !== String(activeSettings.overlapY) ||
+    visibleDraft.wallAnchorageDepth !==
+      String(activeSettings.wallAnchorageDepth);
 
   function updateDraftValue(field: keyof NumericDraftValues, value: string) {
-    setNumericDraft((current) => ({ ...current, [field]: value }));
+    setNumericDraft((current) => ({
+      zoneId: activeZoneId,
+      values: {
+        ...(current.zoneId === activeZoneId
+          ? current.values
+          : createDraftValues(activeSettings)),
+        [field]: value
+      }
+    }));
   }
 
   function applyNumericDraft() {
     const nextSettings = {
-      sheetWidth: draftNumber(numericDraft.sheetWidth, baseMeshSettings.sheetWidth),
+      sheetWidth: draftNumber(visibleDraft.sheetWidth, activeSettings.sheetWidth),
       sheetLength: draftNumber(
-        numericDraft.sheetLength,
-        baseMeshSettings.sheetLength
+        visibleDraft.sheetLength,
+        activeSettings.sheetLength
       ),
-      overlapX: draftNumber(numericDraft.overlapX, baseMeshSettings.overlapX),
-      overlapY: draftNumber(numericDraft.overlapY, baseMeshSettings.overlapY),
+      overlapX: draftNumber(visibleDraft.overlapX, activeSettings.overlapX),
+      overlapY: draftNumber(visibleDraft.overlapY, activeSettings.overlapY),
       wallAnchorageDepth: draftNumber(
-        numericDraft.wallAnchorageDepth,
-        baseMeshSettings.wallAnchorageDepth
+        visibleDraft.wallAnchorageDepth,
+        activeSettings.wallAnchorageDepth
       )
     };
 
     setNumericDraft({
-      sheetWidth: String(nextSettings.sheetWidth),
-      sheetLength: String(nextSettings.sheetLength),
-      overlapX: String(nextSettings.overlapX),
-      overlapY: String(nextSettings.overlapY),
-      wallAnchorageDepth: String(nextSettings.wallAnchorageDepth)
+      zoneId: activeZoneId,
+      values: {
+        sheetWidth: String(nextSettings.sheetWidth),
+        sheetLength: String(nextSettings.sheetLength),
+        overlapX: String(nextSettings.overlapX),
+        overlapY: String(nextSettings.overlapY),
+        wallAnchorageDepth: String(nextSettings.wallAnchorageDepth)
+      }
     });
-    updateBaseMeshSettings(nextSettings);
+    updateActiveMeshZoneParameters(nextSettings);
   }
 
   function resetMeshSettings() {
-    setNumericDraft(createDraftValues(mockBaseMeshSettings));
+    setNumericDraft({
+      zoneId: "ZONE-MAIN",
+      values: createDraftValues(mockBaseMeshSettings)
+    });
     resetToMockData();
   }
 
@@ -172,12 +210,56 @@ export function BaseMeshPanel() {
             </div>
           </div>
 
+          <div className="space-y-3 rounded-md border bg-muted/20 p-3">
+            <div className="flex items-center justify-between gap-2">
+              <Label>אזורי רשת</Label>
+              <Button
+                className="h-8 gap-1 px-2"
+                variant={isDrawingZone ? "secondary" : "default"}
+                onClick={beginDrawingZone}
+              >
+                <Plus className="h-3.5 w-3.5" />
+                {isDrawingZone ? "Drawing..." : "Add Zone"}
+              </Button>
+            </div>
+            {isDrawingZone ? (
+              <div className="rounded-md border border-blue-200 bg-blue-50 p-2 text-xs leading-5 text-blue-800">
+                לחץ וגרור עם העכבר כדי להגדיר את שטח הרשת החדשה
+              </div>
+            ) : null}
+            <div className="space-y-2">
+              {meshZones.map((zone) => (
+                <button
+                  key={zone.id}
+                  className={`w-full rounded-md border px-3 py-2 text-left text-sm transition ${
+                    zone.id === activeZoneId
+                      ? "border-primary bg-primary/10 text-primary"
+                      : "bg-background hover:bg-muted"
+                  }`}
+                  suppressHydrationWarning
+                  type="button"
+                  onClick={() => setActiveZoneId(zone.id)}
+                >
+                  <span className="font-medium" suppressHydrationWarning>
+                    {zone.name}
+                  </span>
+                  <span
+                    className="ml-2 text-xs text-muted-foreground"
+                    suppressHydrationWarning
+                  >
+                    {zone.isMainZone ? "Main Zone" : zone.id}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+
           <div className="space-y-2">
             <Label>Diameter</Label>
             <Select
-              value={String(baseMeshSettings.diameter)}
+              value={String(activeSettings.diameter)}
               onValueChange={(value) =>
-                updateBaseMeshSettings({
+                updateActiveMeshZoneParameters({
                   diameter: Number(value) as BaseMeshSettings["diameter"]
                 })
               }
@@ -198,9 +280,9 @@ export function BaseMeshPanel() {
           <div className="space-y-2">
             <Label>Spacing / Gap</Label>
             <Select
-              value={String(baseMeshSettings.spacing)}
+              value={String(activeSettings.spacing)}
               onValueChange={(value) =>
-                updateBaseMeshSettings({
+                updateActiveMeshZoneParameters({
                   spacing: Number(value) as BaseMeshSettings["spacing"]
                 })
               }
@@ -226,7 +308,7 @@ export function BaseMeshPanel() {
                 min={500}
                 step={100}
                 type="number"
-                value={numericDraft.sheetWidth}
+                value={visibleDraft.sheetWidth}
                 onChange={(event) =>
                   updateDraftValue("sheetWidth", event.target.value)
                 }
@@ -239,7 +321,7 @@ export function BaseMeshPanel() {
                 min={1000}
                 step={100}
                 type="number"
-                value={numericDraft.sheetLength}
+                value={visibleDraft.sheetLength}
                 onChange={(event) =>
                   updateDraftValue("sheetLength", event.target.value)
                 }
@@ -255,7 +337,7 @@ export function BaseMeshPanel() {
                 min={0}
                 step={50}
                 type="number"
-                value={numericDraft.overlapX}
+                value={visibleDraft.overlapX}
                 onChange={(event) =>
                   updateDraftValue("overlapX", event.target.value)
                 }
@@ -268,7 +350,7 @@ export function BaseMeshPanel() {
                 min={0}
                 step={50}
                 type="number"
-                value={numericDraft.overlapY}
+                value={visibleDraft.overlapY}
                 onChange={(event) =>
                   updateDraftValue("overlapY", event.target.value)
                 }
@@ -285,7 +367,7 @@ export function BaseMeshPanel() {
               min={0}
               step={25}
               type="number"
-              value={numericDraft.wallAnchorageDepth}
+              value={visibleDraft.wallAnchorageDepth}
               onChange={(event) =>
                 updateDraftValue("wallAnchorageDepth", event.target.value)
               }
@@ -303,9 +385,9 @@ export function BaseMeshPanel() {
           <div className="space-y-2">
             <Label>Origin Corner</Label>
             <Select
-              value={baseMeshSettings.originCorner}
+              value={activeSettings.originCorner}
               onValueChange={(value: BaseMeshSettings["originCorner"]) =>
-                updateBaseMeshSettings({ originCorner: value })
+                updateActiveMeshZoneParameters({ originCorner: value })
               }
             >
               <SelectTrigger>
@@ -321,49 +403,14 @@ export function BaseMeshPanel() {
             </Select>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-2">
-              <Label htmlFor="grid-offset-x">Grid Offset X (mm)</Label>
-              <Input
-                id="grid-offset-x"
-                step={50}
-                type="number"
-                value={baseMeshSettings.gridOffsetX}
-                onChange={(event) => {
-                  const nextValue = Number(event.target.value);
-
-                  if (Number.isFinite(nextValue)) {
-                    updateBaseMeshSettings({ gridOffsetX: nextValue });
-                  }
-                }}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="grid-offset-y">Grid Offset Y (mm)</Label>
-              <Input
-                id="grid-offset-y"
-                step={50}
-                type="number"
-                value={baseMeshSettings.gridOffsetY}
-                onChange={(event) => {
-                  const nextValue = Number(event.target.value);
-
-                  if (Number.isFinite(nextValue)) {
-                    updateBaseMeshSettings({ gridOffsetY: nextValue });
-                  }
-                }}
-              />
-            </div>
-          </div>
-
           <div className="space-y-2">
             <Label>Orientation Preference</Label>
             <ToggleGroup
               className="grid w-full grid-cols-2"
-              value={baseMeshSettings.orientation}
+              value={activeSettings.orientation}
               onValueChange={(value) => {
                 if (value === "horizontal" || value === "vertical") {
-                  updateBaseMeshSettings({ orientation: value });
+                  updateActiveMeshZoneParameters({ orientation: value });
                 }
               }}
             >
@@ -393,20 +440,19 @@ export function BaseMeshPanel() {
           </div>
 
           <div className="rounded-md border bg-muted/30 p-3 text-sm leading-6 text-muted-foreground">
-            Ø{baseMeshSettings.diameter}@{baseMeshSettings.spacing} | Sheet{" "}
-            {baseMeshSettings.sheetWidth} x {baseMeshSettings.sheetLength}mm |
+            Active zone: {activeMeshZone.name}
+            <br />
+            Ø{activeSettings.diameter}@{activeSettings.spacing} | Sheet{" "}
+            {activeSettings.sheetWidth} x {activeSettings.sheetLength}mm |
             Cover {slabGeometry.concreteCover}mm
             <br />
-            Wall anchorage: {baseMeshSettings.wallAnchorageDepth}mm
+            Wall anchorage: {activeSettings.wallAnchorageDepth}mm
             <br />
             Active: {activeWidth} x {activeLength}mm | Step X: {stepX}mm | Step
             Y: {stepY}mm
             <br />
-            Grid offset: X {baseMeshSettings.gridOffsetX}mm | Y{" "}
-            {baseMeshSettings.gridOffsetY}mm
-            <br />
             Recommended: {layoutComparison.recommendedOrientation} | Active:{" "}
-            {baseMeshSettings.orientation}
+            {activeSettings.orientation}
             <br />
             Sheets: {activeLayout.sheetCount} | Steel area:{" "}
             {squareMeters(activeLayout.rawSheetArea)}m² | Waste:{" "}

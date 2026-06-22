@@ -5,6 +5,29 @@ export type Point = {
 
 export type Polygon = Point[];
 
+export type CadLineEntity = {
+  id: string;
+  layer: string;
+  color?: string;
+  lineWeightPx?: number;
+  points: Point[];
+};
+
+export type CadTextEntity = {
+  id: string;
+  layer: string;
+  color?: string;
+  heightPx?: number;
+  position: Point;
+  rotation?: number;
+  text: string;
+};
+
+export type DwgUnderlay = {
+  lines: CadLineEntity[];
+  texts: CadTextEntity[];
+};
+
 export type SlabOpening = {
   id: string;
   label: string;
@@ -25,6 +48,7 @@ export type SlabGeometry = {
   boundary: Polygon;
   meshBoundary?: Polygon;
   meshInteriorBoundary?: Polygon;
+  dwgUnderlay?: DwgUnderlay;
   openings: SlabOpening[];
   structuralElements: StructuralElement[];
   concreteCover: number;
@@ -44,12 +68,24 @@ export type BaseMeshSettings = {
   wallAnchorageDepth: number;
 };
 
+export type MeshZone = {
+  id: string;
+  name: string;
+  isMainZone: boolean;
+  geometry: Polygon;
+  parameters: BaseMeshSettings;
+};
+
 export type StructuralModel = {
   slabGeometry: SlabGeometry;
-  baseMeshSettings: BaseMeshSettings;
+  meshZones: MeshZone[];
+  activeZoneId: string;
 };
 
 export type BaseMeshSettingsUpdate = Partial<BaseMeshSettings>;
+export type MeshZoneUpdate = Partial<Omit<MeshZone, "id" | "parameters">> & {
+  parameters?: BaseMeshSettingsUpdate;
+};
 
 export interface MeshSheet {
   id: string;
@@ -64,6 +100,7 @@ export interface MeshSheet {
   visiblePolygon: { x: number; y: number }[];
   visiblePolygons: { x: number; y: number }[][];
   diagonalSegments: { start: Point; end: Point }[];
+  zoneId?: string;
 }
 
 export type MeshSheetLayoutResult = {
@@ -93,5 +130,6 @@ export type ExportedReinforcementConfiguration = {
   exportedAt: string;
   standard: "IS-466";
   slabGeometry: SlabGeometry;
-  baseMeshSettings: BaseMeshSettings;
+  meshZones: MeshZone[];
+  activeZoneId: string;
 };
