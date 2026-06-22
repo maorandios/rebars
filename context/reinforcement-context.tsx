@@ -13,6 +13,7 @@ import {
   mockBaseMeshSettings,
   mockSlabGeometry
 } from "@/data/mockStructureData";
+import { compareBaseMeshOrientations } from "@/lib/geometry/mesh-sheet-layout";
 import type {
   BaseMeshSettings,
   BaseMeshSettingsUpdate,
@@ -40,23 +41,48 @@ function cloneBaseMeshSettings() {
   return structuredClone(mockBaseMeshSettings);
 }
 
+function withRecommendedOrientation(
+  slabGeometry: SlabGeometry,
+  settings: BaseMeshSettings
+) {
+  return {
+    ...settings,
+    orientation: compareBaseMeshOrientations(slabGeometry, settings)
+      .recommendedOrientation
+  };
+}
+
 export function ReinforcementProvider({ children }: { children: ReactNode }) {
   const [slabGeometry, setSlabGeometry] = useState<SlabGeometry>(() =>
     cloneSlabGeometry()
   );
   const [baseMeshSettings, setBaseMeshSettings] =
-    useState<BaseMeshSettings>(() => cloneBaseMeshSettings());
+    useState<BaseMeshSettings>(() =>
+      withRecommendedOrientation(cloneSlabGeometry(), cloneBaseMeshSettings())
+    );
 
   const updateBaseMeshSettings = useCallback(
     (patch: BaseMeshSettingsUpdate) => {
-      setBaseMeshSettings((current) => ({ ...current, ...patch }));
+      setBaseMeshSettings((current) => {
+        const nextSettings = { ...current, ...patch };
+
+        if ("orientation" in patch) {
+          return nextSettings;
+        }
+
+        return withRecommendedOrientation(slabGeometry, nextSettings);
+      });
     },
-    []
+    [slabGeometry]
   );
 
   const resetToMockData = useCallback(() => {
-    setSlabGeometry(cloneSlabGeometry());
-    setBaseMeshSettings(cloneBaseMeshSettings());
+    const nextSlabGeometry = cloneSlabGeometry();
+
+    setSlabGeometry(nextSlabGeometry);
+    setBaseMeshSettings(
+      withRecommendedOrientation(nextSlabGeometry, cloneBaseMeshSettings())
+    );
   }, []);
 
   const exportConfiguration = useCallback(

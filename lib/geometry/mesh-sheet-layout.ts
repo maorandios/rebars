@@ -1,5 +1,6 @@
 import type {
   BaseMeshSettings,
+  BaseMeshOrientationComparison,
   MeshSheet,
   MeshSheetLayoutResult,
   Point,
@@ -143,16 +144,23 @@ function subtractPolygonSpans(
 function createDiagonalSegments(
   candidate: SheetCandidate,
   fragments: Polygon[],
-  holes: Polygon[]
+  holes: Polygon[],
+  originCorner: BaseMeshSettings["originCorner"]
 ): MeshSheet["diagonalSegments"] {
-  const start = { x: candidate.x, y: candidate.y };
-  const end = {
-    x: candidate.x + candidate.activeWidth,
-    y: candidate.y + candidate.activeLength
-  };
+  return fragments.flatMap((fragment) => {
+    const bounds = polygonBounds(fragment);
+    const isLeftOrigin = originCorner.endsWith("left");
+    const isTopOrigin = originCorner.startsWith("top");
+    const start = {
+      x: isLeftOrigin ? bounds.minX : bounds.maxX,
+      y: isTopOrigin ? bounds.minY : bounds.maxY
+    };
+    const end = {
+      x: isLeftOrigin ? bounds.maxX : bounds.minX,
+      y: isTopOrigin ? bounds.maxY : bounds.minY
+    };
 
-  return fragments.flatMap((fragment) =>
-    subtractPolygonSpans(
+    return subtractPolygonSpans(
       start,
       end,
       segmentPolygonSpans(start, end, fragment),
@@ -160,8 +168,8 @@ function createDiagonalSegments(
     ).map((span) => ({
       start: pointAt(start, end, span.start),
       end: pointAt(start, end, span.end)
-    }))
-  );
+    }));
+  });
 }
 
 function interpolateBoundary(
@@ -214,6 +222,10 @@ function getMeshPlacementBoundary(
     outerCoverBoundary,
     settings.wallAnchorageDepth
   );
+}
+
+function getGridOriginBoundary(slabGeometry: SlabGeometry) {
+  return slabGeometry.boundary;
 }
 
 function polygonCollectionArea(polygons: Polygon[]) {
@@ -282,17 +294,34 @@ export function createSheetRectangle(
 function optimizeAxisLayout(
   min: number,
   max: number,
+  originMin: number,
+  originMax: number,
   size: number,
   overlap: number,
-  reverse: boolean
+  reverse: boolean,
+  offset: number
 ): AxisLayout {
   const minimumEndStrip = 500;
-  const extent = max - min;
   const baseStep = Math.max(1, size - overlap);
+  const anchorStart = reverse
+    ? originMax - size - offset
+    : originMin + offset;
+  const anchorEnd = reverse ? originMax - offset : anchorStart + size;
+  const effectiveMin = reverse ? min : Math.max(min, anchorStart);
+  const effectiveMax = reverse ? Math.min(max, anchorEnd) : max;
+  const extent = Math.max(0, effectiveMax - effectiveMin);
+
+  if (extent <= 0) {
+    return {
+      positions: [],
+      optimizedOverlap: overlap,
+      step: baseStep
+    };
+  }
 
   if (extent <= size) {
     return {
-      positions: [reverse ? max - size : min],
+      positions: [anchorStart],
       optimizedOverlap: overlap,
       step: baseStep
     };
@@ -308,9 +337,41 @@ function optimizeAxisLayout(
     ? Math.max(1, (extent - minimumEndStrip) / (sheetCount - 1))
     : baseStep;
   const optimizedOverlap = Math.max(0, size - step);
-  const positions = Array.from({ length: sheetCount }, (_, index) =>
-    reverse ? max - size - index * step : min + index * step
-  );
+  let start = anchorStart;
+
+  if (reverse) {
+    while (start > max) {
+      start -= step;
+    }
+  } else {
+    while (start + size < min) {
+      start += step;
+    }
+  }
+
+  const positions: number[] = [];
+
+  if (reverse) {
+    for (let value = start; value + size >= min; value -= step) {
+      positions.push(value);
+    }
+
+    return {
+      positions: positions.reverse(),
+      optimizedOverlap,
+      step
+    };
+  }
+
+  for (let value = start; value <= max; value += step) {
+    positions.push(value);
+  }
+
+  if (positions.length === 0 || positions[positions.length - 1] + size < max) {
+    positions.push(
+      (positions.length > 0 ? positions[positions.length - 1] : start) + step
+    );
+  }
 
   return {
     positions,
@@ -321,6 +382,7 @@ function optimizeAxisLayout(
 
 export function generateSheetCandidates(
   bounds: Bounds,
+  originBounds: Bounds,
   settings: ActiveLayoutSettings
 ): {
   candidates: SheetCandidate[];
@@ -331,20 +393,26 @@ export function generateSheetCandidates(
 } {
   const { activeWidth, activeLength } = getActiveSheetDimensions(settings);
   const reverseX = settings.originCorner.endsWith("right");
-  const reverseY = settings.originCorner.startsWith("top");
+  const reverseY = settings.originCorner.startsWith("bottom");
   const xLayout = optimizeAxisLayout(
     bounds.minX,
     bounds.maxX,
+    originBounds.minX,
+    originBounds.maxX,
     activeWidth,
     settings.overlapX,
-    reverseX
+    reverseX,
+    settings.gridOffsetX
   );
   const yLayout = optimizeAxisLayout(
     bounds.minY,
     bounds.maxY,
+    originBounds.minY,
+    originBounds.maxY,
     activeLength,
     settings.overlapY,
-    reverseY
+    reverseY,
+    settings.gridOffsetY
   );
 
   return {
@@ -401,6 +469,13 @@ export function generateBaseMeshLayout(
   slabGeometry: SlabGeometry,
   settings: BaseMeshSettings
 ): MeshSheetLayoutResult {
+  return generateLayoutForOrientation(slabGeometry, settings);
+}
+
+export function compareBaseMeshOrientations(
+  slabGeometry: SlabGeometry,
+  settings: BaseMeshSettings
+): BaseMeshOrientationComparison {
   const horizontal = generateLayoutForOrientation(slabGeometry, {
     ...settings,
     orientation: "horizontal"
@@ -410,16 +485,21 @@ export function generateBaseMeshLayout(
     orientation: "vertical"
   });
 
-  const selected =
-    vertical.sheetCount < horizontal.sheetCount ||
-    (vertical.sheetCount === horizontal.sheetCount &&
-      vertical.cutWasteArea < horizontal.cutWasteArea)
+  const recommended =
+    vertical.cutWasteArea < horizontal.cutWasteArea ||
+    (vertical.cutWasteArea === horizontal.cutWasteArea &&
+      vertical.sheetCount < horizontal.sheetCount)
       ? vertical
       : horizontal;
+  const active =
+    settings.orientation === "horizontal" ? horizontal : vertical;
 
   return {
-    ...selected,
-    requestedOrientation: settings.orientation
+    horizontal,
+    vertical,
+    recommendedOrientation: recommended.selectedOrientation,
+    recommended,
+    active
   };
 }
 
@@ -428,8 +508,10 @@ function generateLayoutForOrientation(
   settings: ActiveLayoutSettings
 ): MeshSheetLayoutResult {
   const placementBoundary = getMeshPlacementBoundary(slabGeometry, settings);
+  const originBoundary = getGridOriginBoundary(slabGeometry);
   const candidateLayout = generateSheetCandidates(
     polygonBounds(placementBoundary),
+    polygonBounds(originBoundary),
     settings
   );
   const holes = getOpeningExclusionPolygons(slabGeometry, settings);
@@ -457,7 +539,12 @@ function generateLayoutForOrientation(
       isCut: isSheetCut(candidate, visiblePolygons),
       visiblePolygon: visiblePolygons[0],
       visiblePolygons,
-      diagonalSegments: createDiagonalSegments(candidate, visiblePolygons, holes)
+      diagonalSegments: createDiagonalSegments(
+        candidate,
+        visiblePolygons,
+        holes,
+        settings.originCorner
+      )
     };
   });
   const rawSheetArea =

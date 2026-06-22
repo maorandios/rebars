@@ -23,6 +23,7 @@ const ToggleGroup = React.forwardRef<HTMLDivElement, ToggleGroupProps>(
         ref={ref}
         className={cn("inline-flex rounded-md border bg-muted p-1", className)}
         role="radiogroup"
+        suppressHydrationWarning
         {...props}
       />
     </ToggleGroupContext.Provider>
@@ -51,6 +52,7 @@ const ToggleGroupItem = React.forwardRef<
         className
       )}
       role="radio"
+      suppressHydrationWarning
       type="button"
       onClick={() => context.onValueChange?.(value)}
       {...props}

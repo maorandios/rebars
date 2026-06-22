@@ -38,6 +38,8 @@ export type BaseMeshSettings = {
   overlapX: number;
   overlapY: number;
   originCorner: "bottom-left" | "bottom-right" | "top-left" | "top-right";
+  gridOffsetX: number;
+  gridOffsetY: number;
   orientation: "horizontal" | "vertical";
   wallAnchorageDepth: number;
 };
@@ -77,6 +79,14 @@ export type MeshSheetLayoutResult = {
   optimizedOverlapY: number;
   stepX: number;
   stepY: number;
+};
+
+export type BaseMeshOrientationComparison = {
+  horizontal: MeshSheetLayoutResult;
+  vertical: MeshSheetLayoutResult;
+  recommendedOrientation: BaseMeshSettings["orientation"];
+  recommended: MeshSheetLayoutResult;
+  active: MeshSheetLayoutResult;
 };
 
 export type ExportedReinforcementConfiguration = {

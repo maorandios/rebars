@@ -72,42 +72,64 @@ const stairOpening = {
   height: 4_800
 };
 
+const perimeterWallThickness = 400;
+
 const perimeterWalls: StructuralElement[] = [
   {
     id: "PW-SOUTH",
     label: "South Perimeter Wall",
     type: "perimeter_wall",
-    polygon: rectangle(0, 0, 30_000, 300)
+    polygon: rectangle(0, 0, 30_000, perimeterWallThickness)
   },
   {
     id: "PW-EAST",
     label: "East Perimeter Wall",
     type: "perimeter_wall",
-    polygon: rectangle(29_700, 0, 300, 17_000)
+    polygon: rectangle(
+      30_000 - perimeterWallThickness,
+      0,
+      perimeterWallThickness,
+      17_000
+    )
   },
   {
     id: "PW-NORTH",
     label: "North Perimeter Wall",
     type: "perimeter_wall",
-    polygon: rectangle(2_000, 16_700, 28_000, 300)
+    polygon: rectangle(
+      2_000,
+      17_000 - perimeterWallThickness,
+      28_000,
+      perimeterWallThickness
+    )
   },
   {
     id: "PW-WEST",
     label: "West Perimeter Wall",
     type: "perimeter_wall",
-    polygon: rectangle(0, 0, 300, 15_000)
+    polygon: rectangle(0, 0, perimeterWallThickness, 15_000)
   },
   {
     id: "PW-STEP-H",
     label: "Step-Back Perimeter Wall",
     type: "perimeter_wall",
-    polygon: rectangle(0, 14_700, 2_000, 300)
+    polygon: rectangle(
+      0,
+      15_000 - perimeterWallThickness,
+      2_000,
+      perimeterWallThickness
+    )
   },
   {
     id: "PW-STEP-V",
     label: "Step-Back Return Wall",
     type: "perimeter_wall",
-    polygon: rectangle(2_000, 15_000, 300, 2_000)
+    polygon: rectangle(
+      2_000,
+      15_000,
+      perimeterWallThickness,
+      2_000
+    )
   }
 ];
 
@@ -169,12 +191,12 @@ export const mockSlabGeometry: SlabGeometry = {
     { x: 30, y: 14_970 }
   ],
   meshInteriorBoundary: [
-    { x: 300, y: 300 },
-    { x: 29_700, y: 300 },
-    { x: 29_700, y: 16_700 },
-    { x: 2_300, y: 16_700 },
-    { x: 2_300, y: 14_700 },
-    { x: 300, y: 14_700 }
+    { x: perimeterWallThickness, y: perimeterWallThickness },
+    { x: 30_000 - perimeterWallThickness, y: perimeterWallThickness },
+    { x: 30_000 - perimeterWallThickness, y: 17_000 - perimeterWallThickness },
+    { x: 2_000 + perimeterWallThickness, y: 17_000 - perimeterWallThickness },
+    { x: 2_000 + perimeterWallThickness, y: 15_000 - perimeterWallThickness },
+    { x: perimeterWallThickness, y: 15_000 - perimeterWallThickness }
   ],
   openings: [
     {
@@ -216,6 +238,8 @@ export const mockBaseMeshSettings: BaseMeshSettings = {
   overlapX: 300,
   overlapY: 300,
   originCorner: "bottom-left",
+  gridOffsetX: 0,
+  gridOffsetY: 0,
   orientation: "horizontal",
   wallAnchorageDepth: 200
 };

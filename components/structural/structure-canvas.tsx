@@ -231,6 +231,48 @@ function drawMeshSheets(
   }
 }
 
+function gridOriginPoint(
+  slabGeometry: SlabGeometry,
+  settings: BaseMeshSettings
+): Point {
+  const bounds = polygonBounds(slabGeometry.boundary);
+
+  return {
+    x: settings.originCorner.endsWith("right") ? bounds.maxX : bounds.minX,
+    y: settings.originCorner.startsWith("bottom") ? bounds.maxY : bounds.minY
+  };
+}
+
+function drawGridOriginMarker(
+  context: CanvasRenderingContext2D,
+  slabGeometry: SlabGeometry,
+  settings: BaseMeshSettings,
+  scale: number
+) {
+  const origin = gridOriginPoint(slabGeometry, settings);
+  const markerSize = screenPx(9, scale);
+
+  context.save();
+  context.beginPath();
+  context.moveTo(origin.x - markerSize, origin.y);
+  context.lineTo(origin.x + markerSize, origin.y);
+  context.moveTo(origin.x, origin.y - markerSize);
+  context.lineTo(origin.x, origin.y + markerSize);
+  context.strokeStyle = "#0057ff";
+  context.lineWidth = screenPx(1.4, scale);
+  context.stroke();
+  context.beginPath();
+  context.arc(origin.x, origin.y, screenPx(3, scale), 0, Math.PI * 2);
+  context.fillStyle = "#0057ff";
+  context.fill();
+  drawText(context, "GRID 0,0", origin.x + markerSize * 2, origin.y, scale, {
+    align: "left",
+    color: "#0057ff",
+    size: 9
+  });
+  context.restore();
+}
+
 export function StructureCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -293,6 +335,12 @@ export function StructureCanvas() {
     drawStructuralBackground(context, slabGeometry, scaleRef.current);
     drawMeshSheets(context, slabGeometry, baseMeshSettings, scaleRef.current);
     drawSlabGeometry(context, slabGeometry, scaleRef.current);
+      drawGridOriginMarker(
+        context,
+        slabGeometry,
+        baseMeshSettings,
+        scaleRef.current
+      );
   }, [baseMeshSettings, slabGeometry]);
 
   useEffect(() => {
