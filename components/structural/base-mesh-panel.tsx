@@ -233,12 +233,12 @@ export function MeshZonesPanel() {
 
                     setUploadStatus(
                       didGenerate
-                        ? "Generated SLAB from active layers."
+                        ? "Generated WORKING-SLAB from active layers."
                         : "No usable geometry found in active layers."
                     );
                   }}
                 >
-                  Generate SLAB From Active Layers
+                  Generate Working Slab
                 </Button>
                 <Label>Set Concrete Boundary Layer</Label>
                 <Select

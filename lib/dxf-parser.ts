@@ -6,15 +6,22 @@ import GeometryFactory from "jsts/org/locationtech/jts/geom/GeometryFactory.js";
 import Polygonizer from "jsts/org/locationtech/jts/operation/polygonize/Polygonizer.js";
 import UnaryUnionOp from "jsts/org/locationtech/jts/operation/union/UnaryUnionOp.js";
 import type {
+  IAttdefEntity,
   IArcEntity,
+  IBlock,
   ICircleEntity,
+  IDimensionEntity,
   IDxf,
+  IEllipseEntity,
   IEntity,
+  IInsertEntity,
   ILineEntity,
   ILwpolylineEntity,
   IMtextEntity,
   IPoint,
   IPolylineEntity,
+  ISolidEntity,
+  ISplineEntity,
   ITextEntity
 } from "dxf-parser";
 
@@ -46,6 +53,20 @@ type ChainSegment = {
   start: { x: number; y: number };
 };
 
+type UnderlayConversion = {
+  arcs: CadArcEntity[];
+  circles: CadCircleEntity[];
+  lines: CadLineEntity[];
+  texts: CadTextEntity[];
+};
+
+type EntityTransform = {
+  layer?: string;
+  rotation: number;
+  scale: number;
+  transformPoint: (point: { x: number; y: number }) => { x: number; y: number };
+};
+
 export type ParsedDxfGeometry = {
   dxf: IDxf;
   fileName: string;
@@ -55,14 +76,15 @@ export type ParsedDxfGeometry = {
 const slabLayerPattern =
   /(S[-_ ]*)?(SLAB|CONCRETE|BOUNDARY|OUTLINE|FLOOR|FLOR|WALL|BEAM|STRUC|STRUCTURAL|CONSTR|BAM)/i;
 const openingLayerPattern = /(OPEN|OPENING|SHAFT|VOID|HOLE|ELEV|ELEVATOR|STAIR)/i;
-const defaultHiddenLayerPattern = /(TEXT|DIM|ANNO|GRID|AXIS)/i;
 const slabSourceLayerPattern =
   /(A[-_ ]?FLOR|FLOOR|SLAB|CONCRETE|S[-_ ]?SLAB|S[-_ ]?FLOOR)/i;
 const slabRejectLayerPattern =
   /(IDEN|TEXT|DIM|ANNO|GRID|AXIS|WALL|DETAIL|DETL|SYMB|SYMBOL|HATCH|FURN|DOOR|WINDOW)/i;
+const primaryModelBoundsRejectPattern =
+  /(IDEN|TEXT|DIM|ANNO|GRID|AXIS|DETAIL|DETL|SYMB|SYMBOL|HATCH|FURN|DOOR|WINDOW)/i;
 const duplicatePointTolerance = 5;
 const syntheticClosedNodesLayer = "AUTO-CLOSED-NODES";
-const syntheticFinalSlabLayer = "SLAB";
+const syntheticFinalSlabLayer = "WORKING-SLAB";
 const arcSegmentLength = 750;
 
 function entityId(entity: IEntity, fallback: number) {
@@ -72,7 +94,7 @@ function entityId(entity: IEntity, fallback: number) {
 function toPoint(point: IPoint): { x: number; y: number } {
   return {
     x: point.x,
-    y: point.y
+    y: -point.y
   };
 }
 
@@ -146,112 +168,604 @@ function textRotation(rotation: number | undefined) {
     return 0;
   }
 
-  return normalizeAngle(rotation);
+  return -normalizeAngle(rotation);
 }
 
-function textContent(text: string) {
+function formatDimensionMeasurement(value: number | undefined) {
+  if (!Number.isFinite(value)) {
+    return "";
+  }
+
+  return Number(value)
+    .toFixed(2)
+    .replace(/\.?0+$/, "");
+}
+
+function textContent(text: string, dimensionMeasurement?: string) {
   return text
-    .replace(/\\[fF].*?;/g, "")
+    .replace(/%%[cC]/g, "Ø")
+    .replace(/%%[dD]/g, "°")
+    .replace(/%%[pP]/g, "±")
+    .replace(/<>/g, dimensionMeasurement ?? "<>")
+    .replace(/\\[fF][^;]*;/g, "")
+    .replace(/\\[aA]\d+;/g, "")
+    .replace(/\\[cChHwWtTqQ][^;]*;/g, "")
+    .replace(/\\S([^;]+);/g, (_, stackedText: string) =>
+      stackedText.replace(/[#^]/g, "/")
+    )
     .replace(/\\P/g, "\n")
-    .replace(/[{}\\]/g, "");
+    .replace(/\\[lLoOkK]/g, "")
+    .replace(/[{}]/g, "")
+    .replace(/\\/g, "")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .replace(/D=\n/g, "D=")
+    .replace(/Ø\n/g, "Ø")
+    .trim();
+}
+
+function isNearZeroRotation(rotation: number | undefined) {
+  return Math.abs(rotation ?? 0) < 0.01;
+}
+
+function dimensionTextRotation(dimension: IDimensionEntity, transform: EntityTransform) {
+  const rotation = textRotation(dimension.angle) + transform.rotation;
+
+  return Math.abs(rotation) > 0.01 ? rotation : undefined;
+}
+
+function emptyConversion(): UnderlayConversion {
+  return {
+    arcs: [],
+    circles: [],
+    lines: [],
+    texts: []
+  };
+}
+
+function identityTransform(): EntityTransform {
+  return {
+    rotation: 0,
+    scale: 1,
+    transformPoint: (point) => point
+  };
+}
+
+function transformedLayer(entity: IEntity, transform: EntityTransform) {
+  const layer = entity.layer || "0";
+
+  return layer === "0" && transform.layer ? transform.layer : layer;
+}
+
+function rawEntityPoints(entity: IEntity): { x: number; y: number }[] {
+  if (entity.type === "LINE") {
+    return (entity as ILineEntity).vertices.map(toPoint).filter(isFinitePoint);
+  }
+
+  if (entity.type === "LWPOLYLINE" || entity.type === "POLYLINE") {
+    return (entity as ILwpolylineEntity | IPolylineEntity).vertices
+      .map(toPoint)
+      .filter(isFinitePoint);
+  }
+
+  if (entity.type === "CIRCLE") {
+    const circle = entity as ICircleEntity;
+
+    return circle.center ? [toPoint(circle.center)] : [];
+  }
+
+  if (entity.type === "ARC") {
+    return segmentizeArc(entity as IArcEntity);
+  }
+
+  if (entity.type === "TEXT") {
+    const text = entity as ITextEntity;
+
+    return text.startPoint ? [toPoint(text.startPoint)] : [];
+  }
+
+  if (entity.type === "MTEXT") {
+    const text = entity as IMtextEntity;
+
+    return text.position ? [toPoint(text.position)] : [];
+  }
+
+  if (entity.type === "SOLID" || entity.type === "3DFACE") {
+    return (entity as ISolidEntity).points?.map(toPoint).filter(isFinitePoint) ?? [];
+  }
+
+  if (entity.type === "SPLINE") {
+    const spline = entity as ISplineEntity;
+
+    return (spline.fitPoints?.length ? spline.fitPoints : spline.controlPoints)
+      ?.map(toPoint)
+      .filter(isFinitePoint) ?? [];
+  }
+
+  if (entity.type === "ELLIPSE") {
+    return segmentizeEllipse(entity as IEllipseEntity);
+  }
+
+  return [];
+}
+
+function blockUsesAbsoluteCoordinates(block: IBlock, insert: IInsertEntity) {
+  const blockPoints = block.entities.flatMap(rawEntityPoints);
+
+  if (blockPoints.length === 0 || !insert.position) {
+    return false;
+  }
+
+  const blockBounds = polygonBounds(blockPoints);
+  const insertPoint = toPoint(insert.position);
+  const blockCenter = {
+    x: (blockBounds.minX + blockBounds.maxX) / 2,
+    y: (blockBounds.minY + blockBounds.maxY) / 2
+  };
+  const blockSize = Math.max(
+    blockBounds.maxX - blockBounds.minX,
+    blockBounds.maxY - blockBounds.minY,
+    1
+  );
+  const distanceToInsert = Math.hypot(
+    blockCenter.x - insertPoint.x,
+    blockCenter.y - insertPoint.y
+  );
+  const distanceToOrigin = Math.hypot(blockCenter.x, blockCenter.y);
+
+  return distanceToOrigin > blockSize * 20 && distanceToInsert < blockSize * 2;
+}
+
+function createAbsoluteInsertTransform(
+  parent: EntityTransform,
+  insert: IInsertEntity
+): EntityTransform {
+  return {
+    layer: insert.layer || parent.layer,
+    rotation: parent.rotation,
+    scale: parent.scale,
+    transformPoint: parent.transformPoint
+  };
+}
+
+function createInsertTransform(
+  parent: EntityTransform,
+  insert: IInsertEntity,
+  block: IBlock
+): EntityTransform {
+  const rotation = textRotation(insert.rotation);
+  const cos = Math.cos(rotation);
+  const sin = Math.sin(rotation);
+  const xScale = insert.xScale || 1;
+  const yScale = insert.yScale || 1;
+  const blockBase = block.position ? toPoint(block.position) : { x: 0, y: 0 };
+  const insertPosition = insert.position ? toPoint(insert.position) : { x: 0, y: 0 };
+
+  return {
+    layer: insert.layer || parent.layer,
+    rotation: parent.rotation + rotation,
+    scale: parent.scale * Math.max(Math.abs(xScale), Math.abs(yScale), 1),
+    transformPoint: (point) => {
+      const localX = (point.x - blockBase.x) * xScale;
+      const localY = (point.y - blockBase.y) * yScale;
+
+      return parent.transformPoint({
+        x: insertPosition.x + localX * cos - localY * sin,
+        y: insertPosition.y + localX * sin + localY * cos
+      });
+    }
+  };
+}
+
+function mergeConversion(target: UnderlayConversion, source: UnderlayConversion) {
+  target.arcs.push(...source.arcs);
+  target.circles.push(...source.circles);
+  target.lines.push(...source.lines);
+  target.texts.push(...source.texts);
+}
+
+function conversionPoints(conversion: UnderlayConversion) {
+  return [
+    ...conversion.lines.flatMap((line) => line.points),
+    ...conversion.circles.map((circle) => circle.center),
+    ...conversion.arcs.map((arc) => arc.center),
+    ...conversion.texts.map((text) => text.position)
+  ].filter(isFinitePoint);
+}
+
+function conversionDistanceToPoint(
+  conversion: UnderlayConversion,
+  point: { x: number; y: number }
+) {
+  const points = conversionPoints(conversion);
+
+  if (points.length === 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  const bounds = polygonBounds(points);
+  const center = {
+    x: (bounds.minX + bounds.maxX) / 2,
+    y: (bounds.minY + bounds.maxY) / 2
+  };
+
+  return Math.hypot(center.x - point.x, center.y - point.y);
+}
+
+function expandedBounds(bounds: {
+  maxX: number;
+  maxY: number;
+  minX: number;
+  minY: number;
+}) {
+  const width = bounds.maxX - bounds.minX;
+  const height = bounds.maxY - bounds.minY;
+  const padding = Math.max(width, height) * 0.08;
+
+  return {
+    maxX: bounds.maxX + padding,
+    maxY: bounds.maxY + padding,
+    minX: bounds.minX - padding,
+    minY: bounds.minY - padding
+  };
+}
+
+function boundsOverlap(
+  a: { maxX: number; maxY: number; minX: number; minY: number },
+  b: { maxX: number; maxY: number; minX: number; minY: number }
+) {
+  return (
+    a.minX <= b.maxX &&
+    a.maxX >= b.minX &&
+    a.minY <= b.maxY &&
+    a.maxY >= b.minY
+  );
+}
+
+function conversionOverlapsBounds(
+  conversion: UnderlayConversion,
+  bounds: { maxX: number; maxY: number; minX: number; minY: number }
+) {
+  const points = conversionPoints(conversion);
+
+  return points.length > 0 && boundsOverlap(polygonBounds(points), bounds);
+}
+
+function primaryModelBounds(dxf: IDxf) {
+  const points = dxf.entities
+    .filter(
+      (entity) =>
+        entity.type !== "INSERT" &&
+        entity.type !== "DIMENSION" &&
+        entity.type !== "TEXT" &&
+        entity.type !== "MTEXT" &&
+        entity.type !== "ATTDEF" &&
+        !primaryModelBoundsRejectPattern.test(entity.layer || "0")
+    )
+    .flatMap(rawEntityPoints);
+
+  return points.length > 0 ? expandedBounds(polygonBounds(points)) : undefined;
+}
+
+function modelTextHeight(
+  height: number | undefined,
+  transform: EntityTransform,
+  fallback = 100
+) {
+  return Number.isFinite(height) && height && height > 0
+    ? height * transform.scale
+    : fallback * transform.scale;
 }
 
 function isSlabSourceLayer(layer: string) {
   return slabSourceLayerPattern.test(layer) && !slabRejectLayerPattern.test(layer);
 }
 
-function entityToUnderlay(
+function segmentizeEllipse(ellipse: IEllipseEntity) {
+  if (!ellipse.center || !ellipse.majorAxisEndPoint || !Number.isFinite(ellipse.axisRatio)) {
+    return [];
+  }
+
+  const center = toPoint(ellipse.center);
+  const major = toPoint(ellipse.majorAxisEndPoint);
+  const majorRadius = Math.hypot(major.x, major.y);
+  const minorRadius = majorRadius * Math.abs(ellipse.axisRatio || 1);
+  const axisRotation = Math.atan2(major.y, major.x);
+  const startAngle = normalizeAngle(ellipse.startAngle ?? 0);
+  let endAngle = normalizeAngle(ellipse.endAngle ?? Math.PI * 2);
+
+  if (endAngle <= startAngle) {
+    endAngle += Math.PI * 2;
+  }
+
+  const segmentCount = Math.max(24, Math.ceil((majorRadius * (endAngle - startAngle)) / arcSegmentLength));
+
+  return Array.from({ length: segmentCount + 1 }, (_, index) => {
+    const angle = startAngle + ((endAngle - startAngle) * index) / segmentCount;
+    const x = majorRadius * Math.cos(angle);
+    const y = minorRadius * Math.sin(angle);
+
+    return {
+      x: center.x + x * Math.cos(axisRotation) - y * Math.sin(axisRotation),
+      y: center.y + x * Math.sin(axisRotation) + y * Math.cos(axisRotation)
+    };
+  });
+}
+
+function convertEntityToUnderlay(
+  dxf: IDxf,
   entity: IEntity,
-  index: number
-): {
-  arc?: CadArcEntity;
-  circle?: CadCircleEntity;
-  line?: CadLineEntity;
-  text?: CadTextEntity;
-} {
-  const layer = entity.layer || "0";
+  index: number,
+  transform: EntityTransform = identityTransform(),
+  depth = 0
+): UnderlayConversion {
+  const converted = emptyConversion();
+  const layer = transformedLayer(entity, transform);
   const id = `DXF-${entityId(entity, index)}`;
 
   if (entity.type === "LINE") {
     const line = entity as ILineEntity;
 
-    return {
-      line: {
-        id,
-        layer,
-        lineWeightPx: 0.8,
-        points: line.vertices.map(toPoint).filter(isFinitePoint)
-      }
-    };
+    converted.lines.push({
+      id,
+      layer,
+      lineWeightPx: 0.8,
+      points: line.vertices.map(toPoint).filter(isFinitePoint).map(transform.transformPoint)
+    });
+    return converted;
   }
 
   if (entity.type === "LWPOLYLINE" || entity.type === "POLYLINE") {
-    return {
-      line: polylineToUnderlayLine(entity as ILwpolylineEntity | IPolylineEntity, index)
-    };
+    const line = polylineToUnderlayLine(entity as ILwpolylineEntity | IPolylineEntity, index);
+
+    converted.lines.push({
+      ...line,
+      layer,
+      points: line.points.map(transform.transformPoint)
+    });
+    return converted;
   }
 
   if (entity.type === "CIRCLE") {
     const circle = entity as ICircleEntity;
 
-    return {
-      circle: {
-        center: toPoint(circle.center),
-        id,
-        layer,
-        lineWeightPx: 0.8,
-        radius: circle.radius
-      }
-    };
+    converted.circles.push({
+      center: transform.transformPoint(toPoint(circle.center)),
+      id,
+      layer,
+      lineWeightPx: 0.8,
+      radius: circle.radius * transform.scale
+    });
+    return converted;
   }
 
   if (entity.type === "ARC") {
-    const arc = entity as IArcEntity;
+    const points = segmentizeArc(entity as IArcEntity).map(transform.transformPoint);
 
-    return {
-      arc: {
-        center: toPoint(arc.center),
-        endAngle: normalizeAngle(arc.endAngle),
-        id,
-        layer,
-        lineWeightPx: 0.8,
-        radius: arc.radius,
-        startAngle: normalizeAngle(arc.startAngle)
-      }
-    };
+    if (points.length >= 2) {
+      converted.lines.push({
+      id,
+      layer,
+      lineWeightPx: 0.8,
+        points
+      });
+    }
+    return converted;
   }
 
   if (entity.type === "TEXT") {
     const text = entity as ITextEntity;
 
-    return {
-      text: {
-        heightPx: text.textHeight ? Math.max(8, text.textHeight / 20) : 10,
-        id,
-        layer,
-        position: toPoint(text.startPoint),
-        rotation: textRotation(text.rotation),
-        text: textContent(text.text)
-      }
-    };
+    converted.texts.push({
+      heightPx: modelTextHeight(text.textHeight, transform),
+      id,
+      layer,
+      position: transform.transformPoint(toPoint(text.startPoint)),
+      rotation: textRotation(text.rotation) + transform.rotation,
+      text: textContent(text.text)
+    });
+    return converted;
   }
 
   if (entity.type === "MTEXT") {
     const text = entity as IMtextEntity;
 
-    return {
-      text: {
-        heightPx: text.height ? Math.max(8, text.height / 20) : 10,
-        id,
-        layer,
-        position: toPoint(text.position),
-        rotation: textRotation(text.rotation),
-        text: textContent(text.text)
-      }
-    };
+    converted.texts.push({
+      heightPx: modelTextHeight(text.height, transform),
+      id,
+      layer,
+      position: transform.transformPoint(toPoint(text.position)),
+      rotation: textRotation(text.rotation) + transform.rotation,
+      text: textContent(text.text)
+    });
+    return converted;
   }
 
-  return {};
+  if (entity.type === "ATTDEF") {
+    const text = entity as IAttdefEntity;
+
+    if (!text.invisible && text.text && text.startPoint) {
+      converted.texts.push({
+        heightPx: modelTextHeight(text.textHeight, transform),
+        id,
+        layer,
+        position: transform.transformPoint(toPoint(text.startPoint)),
+        rotation: textRotation(text.rotation) + transform.rotation,
+        text: textContent(text.text)
+      });
+    }
+    return converted;
+  }
+
+  if (entity.type === "SOLID" || entity.type === "3DFACE") {
+    const solid = entity as ISolidEntity;
+    const points = solid.points?.map(toPoint).filter(isFinitePoint).map(transform.transformPoint) ?? [];
+
+    if (points.length >= 3) {
+      converted.lines.push({
+        id,
+        layer,
+        lineWeightPx: 0.8,
+        points: [...points, points[0]]
+      });
+    }
+    return converted;
+  }
+
+  if (entity.type === "SPLINE") {
+    const spline = entity as ISplineEntity;
+    const points = (spline.fitPoints?.length ? spline.fitPoints : spline.controlPoints)
+      ?.map(toPoint)
+      .filter(isFinitePoint)
+      .map(transform.transformPoint) ?? [];
+
+    if (points.length >= 2) {
+      converted.lines.push({
+        id,
+        layer,
+        lineWeightPx: 0.8,
+        points: spline.closed && points[0] ? [...points, points[0]] : points
+      });
+    }
+    return converted;
+  }
+
+  if (entity.type === "ELLIPSE") {
+    const points = segmentizeEllipse(entity as IEllipseEntity).map(transform.transformPoint);
+
+    if (points.length >= 2) {
+      converted.lines.push({
+        id,
+        layer,
+        lineWeightPx: 0.8,
+        points
+      });
+    }
+    return converted;
+  }
+
+  if (entity.type === "INSERT" && depth < 8) {
+    const insert = entity as IInsertEntity;
+    const block = insert.name ? dxf.blocks?.[insert.name] : undefined;
+
+    if (block?.entities?.length) {
+      const convertBlock = (nextTransform: EntityTransform) => {
+        const blockConversion = emptyConversion();
+
+        block.entities.forEach((blockEntity, blockIndex) => {
+          mergeConversion(
+            blockConversion,
+            convertEntityToUnderlay(
+              dxf,
+              blockEntity,
+              Number(`${index}${blockIndex}`),
+              nextTransform,
+              depth + 1
+            )
+          );
+        });
+
+        return blockConversion;
+      };
+      const relativeConversion = convertBlock(
+        createInsertTransform(transform, insert, block)
+      );
+      const absoluteConversion = convertBlock(
+        createAbsoluteInsertTransform(transform, insert)
+      );
+      const insertPoint = insert.position
+        ? transform.transformPoint(toPoint(insert.position))
+        : undefined;
+
+      if (!insertPoint) {
+        return blockUsesAbsoluteCoordinates(block, insert)
+          ? absoluteConversion
+          : relativeConversion;
+      }
+
+      return conversionDistanceToPoint(absoluteConversion, insertPoint) <
+        conversionDistanceToPoint(relativeConversion, insertPoint)
+        ? absoluteConversion
+        : relativeConversion;
+    }
+  }
+
+  if (entity.type === "DIMENSION" && depth < 8) {
+    const dimension = entity as IDimensionEntity;
+    const dimensionMeasurement =
+      formatDimensionMeasurement(dimension.actualMeasurement);
+    const inheritedDimensionRotation = dimension
+      ? dimensionTextRotation(dimension, transform)
+      : undefined;
+    const block = dimension.block ? dxf.blocks?.[dimension.block] : undefined;
+
+    if (block?.entities?.length) {
+      const nextTransform = { ...transform, layer };
+
+      block.entities.forEach((blockEntity, blockIndex) => {
+        const child = convertEntityToUnderlay(
+          dxf,
+          blockEntity,
+          Number(`${index}${blockIndex}`),
+          nextTransform,
+          depth + 1
+        );
+
+        converted.arcs.push(...child.arcs);
+        converted.circles.push(...child.circles);
+        converted.lines.push(...child.lines);
+        converted.texts.push(
+          ...child.texts.map((text) => ({
+            ...text,
+            rotation:
+              inheritedDimensionRotation !== undefined &&
+              isNearZeroRotation(text.rotation)
+                ? inheritedDimensionRotation
+                : text.rotation,
+            text: dimensionMeasurement
+              ? textContent(text.text, dimensionMeasurement)
+              : text.text
+          }))
+        );
+      });
+
+      return converted;
+    }
+  }
+
+  if (entity.type === "DIMENSION") {
+    const dimension = entity as IDimensionEntity;
+    const text =
+      dimension.text && dimension.text !== "<>"
+        ? dimension.text
+        : formatDimensionMeasurement(dimension.actualMeasurement);
+
+    if (dimension.linearOrAngularPoint1 && dimension.linearOrAngularPoint2) {
+      converted.lines.push({
+        id: `${id}-LINE`,
+        layer,
+        lineWeightPx: 0.7,
+        points: [
+          transform.transformPoint(toPoint(dimension.linearOrAngularPoint1)),
+          transform.transformPoint(toPoint(dimension.linearOrAngularPoint2))
+        ]
+      });
+    }
+
+    if (text && dimension.middleOfText) {
+      converted.texts.push({
+        heightPx: modelTextHeight(undefined, transform),
+        id: `${id}-TEXT`,
+        layer,
+        position: transform.transformPoint(toPoint(dimension.middleOfText)),
+        rotation: dimensionTextRotation(dimension, transform),
+        text: textContent(text, formatDimensionMeasurement(dimension.actualMeasurement))
+      });
+    }
+
+    return converted;
+  }
+
+  return converted;
 }
 
 function createUnderlay(
@@ -265,25 +779,23 @@ function createUnderlay(
   const texts: CadTextEntity[] = [];
   const circles: CadCircleEntity[] = [];
   const arcs: CadArcEntity[] = [];
+  const modelBounds = primaryModelBounds(dxf);
 
   dxf.entities.forEach((entity, index) => {
-    const converted = entityToUnderlay(entity, index);
+    const converted = convertEntityToUnderlay(dxf, entity, index);
 
-    if (converted.line && converted.line.points.length >= 2) {
-      lines.push(converted.line);
+    if (
+      entity.type === "INSERT" &&
+      modelBounds &&
+      !conversionOverlapsBounds(converted, modelBounds)
+    ) {
+      return;
     }
 
-    if (converted.text) {
-      texts.push(converted.text);
-    }
-
-    if (converted.circle && converted.circle.radius > 0) {
-      circles.push(converted.circle);
-    }
-
-    if (converted.arc && converted.arc.radius > 0) {
-      arcs.push(converted.arc);
-    }
+    lines.push(...converted.lines.filter((line) => line.points.length >= 2));
+    texts.push(...converted.texts);
+    circles.push(...converted.circles.filter((circle) => circle.radius > 0));
+    arcs.push(...converted.arcs.filter((arc) => arc.radius > 0));
   });
 
   if (options.includeGeneratedSlab) {
@@ -300,10 +812,23 @@ function createUnderlay(
     });
   }
 
-  const layerCounts = new Map<string, number>();
+  const layerCounts = createDxfLayerMap(dxf);
+  const sourceLayerNames = new Set([
+    ...Object.keys(dxf.tables?.layer?.layers ?? {}),
+    ...(dxf.entities ?? []).map((entity) => entity.layer || "0")
+  ]);
 
   for (const entity of [...lines, ...texts, ...circles, ...arcs]) {
-    layerCounts.set(entity.layer, (layerCounts.get(entity.layer) ?? 0) + 1);
+    if (sourceLayerNames.has(entity.layer)) {
+      continue;
+    }
+
+    const currentLayer = layerCounts.get(entity.layer);
+
+    layerCounts.set(entity.layer, {
+      entityCount: (currentLayer?.entityCount ?? 0) + 1,
+      visible: currentLayer?.visible ?? true
+    });
   }
 
   return {
@@ -316,16 +841,40 @@ function createUnderlay(
     ],
     importedFileName: fileName,
     layers: [...layerCounts.entries()]
-      .map(([name, entityCount]) => ({
-        entityCount,
+      .map(([name, layer]) => ({
+        entityCount: layer.entityCount,
         name,
-        visible: !defaultHiddenLayerPattern.test(name)
+        visible: layer.visible
       }))
       .sort((a, b) => a.name.localeCompare(b.name)),
     lines,
     reviewOnly: true,
     texts
   };
+}
+
+function createDxfLayerMap(dxf: IDxf) {
+  const layers = new Map<string, { entityCount: number; visible: boolean }>();
+  const tableLayers = dxf.tables?.layer?.layers ?? {};
+
+  for (const [name, layer] of Object.entries(tableLayers)) {
+    layers.set(name, {
+      entityCount: 0,
+      visible: layer.visible !== false
+    });
+  }
+
+  for (const entity of dxf.entities ?? []) {
+    const layerName = entity.layer || "0";
+    const currentLayer = layers.get(layerName);
+
+    layers.set(layerName, {
+      entityCount: (currentLayer?.entityCount ?? 0) + 1,
+      visible: currentLayer?.visible ?? true
+    });
+  }
+
+  return layers;
 }
 
 function toCadClosedPolyline(
@@ -376,7 +925,7 @@ function isGeometryAssemblyLayer(layer: string) {
 }
 
 function canUseLayerForFallbackAssembly(layer: string) {
-  return !defaultHiddenLayerPattern.test(layer);
+  return Boolean(layer);
 }
 
 function createSegment(
@@ -799,6 +1348,7 @@ function segmentizeArc(arc: IArcEntity) {
     return [];
   }
 
+  const center = toPoint(arc.center);
   const startAngle = normalizeAngle(arc.startAngle);
   let endAngle = normalizeAngle(arc.endAngle);
 
@@ -816,8 +1366,8 @@ function segmentizeArc(arc: IArcEntity) {
     const angle = startAngle + (angleLength * index) / segmentCount;
 
     return {
-      x: arc.center.x + Math.cos(angle) * arc.radius,
-      y: arc.center.y + Math.sin(angle) * arc.radius
+      x: center.x + Math.cos(angle) * arc.radius,
+      y: center.y - Math.sin(angle) * arc.radius
     };
   });
 }

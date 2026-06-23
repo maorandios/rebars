@@ -173,7 +173,7 @@ function drawCadText(
 ) {
   drawText(context, text.text, text.position.x, text.position.y, scale, {
     color: text.color ?? canvasMutedText,
-    height: text.heightPx ? text.heightPx * 20 : cadTextHeight.small,
+    height: text.heightPx ?? cadTextHeight.small,
     rotation: text.rotation,
   });
 }
@@ -223,7 +223,7 @@ function visibleUnderlayLayers(slabGeometry: SlabGeometry) {
 }
 
 function isLayerVisible(visibleLayers: Set<string>, layer: string) {
-  return visibleLayers.size === 0 || visibleLayers.has(layer);
+  return visibleLayers.has(layer);
 }
 
 function drawOpening(
