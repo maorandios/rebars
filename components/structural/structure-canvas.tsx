@@ -1,12 +1,17 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useReinforcement } from "@/context/reinforcement-context";
 import { polygonBounds } from "@/lib/geometry/clipping";
-import { generateBaseMeshLayout } from "@/lib/geometry/mesh-sheet-layout";
+import {
+  compareBaseMeshOrientations,
+  generateBaseMeshLayout
+} from "@/lib/geometry/mesh-sheet-layout";
 import type {
   BaseMeshSettings,
+  CadArcEntity,
+  CadCircleEntity,
   CadLineEntity,
   CadTextEntity,
   MeshSheet,
@@ -36,6 +41,11 @@ const cadTextHeight = {
 const cadMarkerSize = 220;
 const cadArrowSize = 180;
 const minimumDrawnZoneSize = 500;
+const cadCanvasBackground = "#121214";
+const meshBlue = "#0ea5e9";
+const meshActiveBlue = "#38bdf8";
+const canvasText = "#f4f4f5";
+const canvasMutedText = "#d4d4d8";
 
 type ZoneDraft = {
   current: Point;
@@ -134,7 +144,7 @@ function drawText(
   context.translate(x, y);
   context.rotate(options.rotation ?? 0);
   context.font = `${options.height ?? cadTextHeight.label}px Consolas, "Courier New", monospace`;
-  context.fillStyle = options.color ?? "#333333";
+  context.fillStyle = options.color ?? canvasText;
   context.textAlign = options.align ?? "center";
   context.textBaseline = options.baseline ?? "middle";
   context.fillText(text, 0, 0);
@@ -162,10 +172,58 @@ function drawCadText(
   scale: number
 ) {
   drawText(context, text.text, text.position.x, text.position.y, scale, {
-    color: text.color ?? "#555555",
+    color: text.color ?? canvasMutedText,
     height: text.heightPx ? text.heightPx * 20 : cadTextHeight.small,
     rotation: text.rotation,
   });
+}
+
+function drawCadCircle(
+  context: CanvasRenderingContext2D,
+  circle: CadCircleEntity,
+  scale: number
+) {
+  context.beginPath();
+  context.arc(circle.center.x, circle.center.y, circle.radius, 0, Math.PI * 2);
+  setDraftStroke(context, scale, {
+    color: circle.color ?? "#71717a",
+    widthPx: circle.lineWeightPx ?? 0.8
+  });
+  context.stroke();
+  resetDraftStroke(context);
+}
+
+function drawCadArc(
+  context: CanvasRenderingContext2D,
+  arc: CadArcEntity,
+  scale: number
+) {
+  context.beginPath();
+  context.arc(
+    arc.center.x,
+    arc.center.y,
+    arc.radius,
+    arc.startAngle,
+    arc.endAngle
+  );
+  setDraftStroke(context, scale, {
+    color: arc.color ?? "#71717a",
+    widthPx: arc.lineWeightPx ?? 0.8
+  });
+  context.stroke();
+  resetDraftStroke(context);
+}
+
+function visibleUnderlayLayers(slabGeometry: SlabGeometry) {
+  return new Set(
+    slabGeometry.dwgUnderlay?.layers
+      ?.filter((layer) => layer.visible)
+      .map((layer) => layer.name) ?? []
+  );
+}
+
+function isLayerVisible(visibleLayers: Set<string>, layer: string) {
+  return visibleLayers.size === 0 || visibleLayers.has(layer);
 }
 
 function drawOpening(
@@ -176,11 +234,11 @@ function drawOpening(
   const bounds = polygonBounds(opening.polygon);
 
   drawPolygonPath(context, opening.polygon);
-  context.fillStyle = "#ffffff";
+  context.fillStyle = cadCanvasBackground;
   context.fill();
 
   drawPolygonPath(context, opening.polygon);
-  context.strokeStyle = "#000000";
+  context.strokeStyle = "#a1a1aa";
   context.lineWidth = screenPx(3, scale);
   context.stroke();
 
@@ -194,6 +252,7 @@ function drawOpening(
 
   const center = polygonCenter(opening.polygon);
   drawText(context, opening.label, center.x, center.y, scale, {
+    color: canvasText,
     height: cadTextHeight.small
   });
 }
@@ -208,14 +267,31 @@ function drawDwgUnderlay(
   }
 
   context.save();
-  context.globalAlpha = 0.85;
+  context.globalAlpha = 0.38;
+  const visibleLayers = visibleUnderlayLayers(slabGeometry);
 
   for (const line of slabGeometry.dwgUnderlay.lines) {
-    drawCadLine(context, line, scale);
+    if (isLayerVisible(visibleLayers, line.layer)) {
+      drawCadLine(context, line, scale);
+    }
   }
 
   for (const text of slabGeometry.dwgUnderlay.texts) {
-    drawCadText(context, text, scale);
+    if (isLayerVisible(visibleLayers, text.layer)) {
+      drawCadText(context, text, scale);
+    }
+  }
+
+  for (const circle of slabGeometry.dwgUnderlay.circles ?? []) {
+    if (isLayerVisible(visibleLayers, circle.layer)) {
+      drawCadCircle(context, circle, scale);
+    }
+  }
+
+  for (const arc of slabGeometry.dwgUnderlay.arcs ?? []) {
+    if (isLayerVisible(visibleLayers, arc.layer)) {
+      drawCadArc(context, arc, scale);
+    }
   }
 
   context.restore();
@@ -245,7 +321,7 @@ function drawConcreteHatch(
     context.lineTo(x + overshoot, bounds.minY);
   }
 
-  context.strokeStyle = "#9a9a9a";
+  context.strokeStyle = "#71717a";
   context.globalAlpha = 0.35;
   context.lineWidth = screenPx(0.7, scale);
   context.stroke();
@@ -259,11 +335,11 @@ function drawStructuralElement(
   scale: number
 ) {
   drawPolygonPath(context, element.polygon);
-  context.fillStyle = "#d3d3d3";
+  context.fillStyle = "#3f3f46";
   context.fill();
   drawConcreteHatch(context, element.polygon, scale);
   drawPolygonPath(context, element.polygon);
-  context.strokeStyle = "#444444";
+  context.strokeStyle = "#a1a1aa";
   context.lineWidth = screenPx(element.type === "column" ? 2.2 : 2, scale);
   context.stroke();
 }
@@ -283,10 +359,27 @@ function drawSlabGeometry(
   slabGeometry: SlabGeometry,
   scale: number
 ) {
+  const bounds = polygonBounds(slabGeometry.boundary);
+
   drawPolygonPath(context, slabGeometry.boundary);
-  setDraftStroke(context, scale, { color: "#666666", widthPx: 1.5 });
+  setDraftStroke(context, scale, { color: "#a1a1aa", widthPx: 1.5 });
   context.stroke();
   resetDraftStroke(context);
+
+  drawText(
+    context,
+    `SLAB ${Math.round(bounds.maxX - bounds.minX)}x${Math.round(
+      bounds.maxY - bounds.minY
+    )}mm`,
+    bounds.minX,
+    bounds.minY - 550,
+    scale,
+    {
+      align: "left",
+      color: canvasMutedText,
+      height: cadTextHeight.small
+    }
+  );
 
   for (const opening of slabGeometry.openings) {
     drawOpening(context, opening, scale);
@@ -297,17 +390,31 @@ function drawMeshSheet(
   context: CanvasRenderingContext2D,
   sheet: MeshSheet,
   scale: number,
-  opacity = 1
+  opacity = 1,
+  isActive = false
 ) {
   for (const visiblePolygon of sheet.visiblePolygons) {
+    context.save();
+    drawPolygonPath(context, visiblePolygon);
+    context.globalAlpha = 0.12 * opacity;
+    context.fillStyle = meshBlue;
+    context.fill();
+    context.restore();
+
+    context.save();
+    if (isActive) {
+      context.shadowBlur = 10;
+      context.shadowColor = meshActiveBlue;
+    }
     drawPolygonPath(context, visiblePolygon);
     setDraftStroke(context, scale, {
       alpha: opacity,
-      color: "#00ff00",
-      widthPx: 1
+      color: isActive ? meshActiveBlue : meshBlue,
+      widthPx: isActive ? 1.25 : 1
     });
     context.stroke();
     resetDraftStroke(context);
+    context.restore();
   }
 
   for (const diagonal of sheet.diagonalSegments) {
@@ -315,8 +422,8 @@ function drawMeshSheet(
     context.moveTo(diagonal.start.x, diagonal.start.y);
     context.lineTo(diagonal.end.x, diagonal.end.y);
     setDraftStroke(context, scale, {
-      alpha: 0.55 * opacity,
-      color: "#00aa00",
+      alpha: (isActive ? 0.75 : 0.5) * opacity,
+      color: isActive ? meshActiveBlue : meshBlue,
       widthPx: 0.7
     });
     context.stroke();
@@ -337,13 +444,13 @@ function drawMeshSheet(
   context.globalAlpha = opacity;
   drawText(
     context,
-    `${sheet.length}/${sheet.width}`,
+    `SHEET ${sheet.length}x${sheet.width}`,
     (labelSegment.start.x + labelSegment.end.x) / 2,
     (labelSegment.start.y + labelSegment.end.y) / 2,
     scale,
     {
-      color: "#008000",
-      height: cadTextHeight.small,
+      color: isActive ? canvasText : canvasMutedText,
+      height: cadTextHeight.small * 0.75,
       rotation: sheet.orientation === "horizontal" ? 0 : Math.PI / 2,
     }
   );
@@ -367,10 +474,11 @@ function drawMeshSheets(
       zone.geometry,
       exclusionPolygons
     );
-    const opacity = zone.id === activeZoneId ? 1 : 0.45;
+    const isActive = zone.id === activeZoneId;
+    const opacity = isActive ? 1 : 0.35;
 
     for (const sheet of layout.sheets) {
-      drawMeshSheet(context, sheet, scale, opacity);
+      drawMeshSheet(context, sheet, scale, opacity, isActive);
     }
   }
 }
@@ -402,16 +510,16 @@ function drawGridOriginMarker(
   context.lineTo(origin.x + markerSize, origin.y);
   context.moveTo(origin.x, origin.y - markerSize);
   context.lineTo(origin.x, origin.y + markerSize);
-  context.strokeStyle = "#0057ff";
+  context.strokeStyle = meshActiveBlue;
   context.lineWidth = screenPx(1.4, scale);
   context.stroke();
   context.beginPath();
   context.arc(origin.x, origin.y, cadMarkerSize / 3, 0, Math.PI * 2);
-  context.fillStyle = "#0057ff";
+  context.fillStyle = meshActiveBlue;
   context.fill();
   drawText(context, "GRID 0,0", origin.x + markerSize * 2, origin.y, scale, {
     align: "left",
-    color: "#0057ff",
+    color: meshActiveBlue,
     height: cadTextHeight.small
   });
   context.restore();
@@ -431,7 +539,7 @@ function drawArrowLine(
   start: Point,
   end: Point,
   scale: number,
-  color = "#333333"
+  color = canvasMutedText
 ) {
   const angle = Math.atan2(end.y - start.y, end.x - start.x);
   const arrowSize = cadArrowSize;
@@ -490,13 +598,13 @@ function drawMeshDetailCallout(
   ];
 
   drawPolygonPath(context, frame);
-  setDraftStroke(context, scale, { color: "#111111", widthPx: 1.2 });
+  setDraftStroke(context, scale, { color: canvasMutedText, widthPx: 1.2 });
   context.stroke();
   resetDraftStroke(context);
 
   drawText(context, "MESH A - רשת א'", origin.x + 450, origin.y + 450, scale, {
     align: "left",
-    color: "#111111",
+    color: canvasText,
     height: cadTextHeight.title
   });
   drawText(
@@ -505,11 +613,11 @@ function drawMeshDetailCallout(
     origin.x + 450,
     origin.y + 850,
     scale,
-    { align: "left", color: "#111111", height: cadTextHeight.label }
+    { align: "left", color: canvasText, height: cadTextHeight.label }
   );
 
   drawPolygonPath(context, meshBox);
-  setDraftStroke(context, scale, { color: "#00aa00", widthPx: 1.2 });
+  setDraftStroke(context, scale, { color: meshBlue, widthPx: 1.2 });
   context.stroke();
 
   for (
@@ -550,7 +658,7 @@ function drawMeshDetailCallout(
     boxOrigin.x + boxWidth / 2,
     boxOrigin.y + boxHeight + 1_050,
     scale,
-    { color: "#111111", height: cadTextHeight.label }
+    { color: canvasText, height: cadTextHeight.label }
   );
   drawArrowLine(
     context,
@@ -565,7 +673,7 @@ function drawMeshDetailCallout(
     boxOrigin.y + boxHeight / 2,
     scale,
     {
-      color: "#111111",
+      color: canvasText,
       height: cadTextHeight.label,
       rotation: Math.PI / 2
     }
@@ -577,7 +685,7 @@ function drawMeshDetailCallout(
     origin.x + 450,
     origin.y + meshDetailSize.height - 550,
     scale,
-    { align: "left", color: "#555555", height: cadTextHeight.small }
+    { align: "left", color: canvasMutedText, height: cadTextHeight.small }
   );
 }
 
@@ -608,7 +716,7 @@ function drawZoneDraft(
 
   drawPolygonPath(context, polygon);
   setDraftStroke(context, scale, {
-    color: "#0057ff",
+    color: meshActiveBlue,
     dash: [10, 6],
     widthPx: 1.5
   });
@@ -640,7 +748,17 @@ export function StructureCanvas() {
     isDrawingZone,
     cancelDrawingZone,
     commitDrawnMeshZone,
+    updateActiveMeshZoneParameters
   } = useReinforcement();
+  const layoutComparison = useMemo(
+    () =>
+      compareBaseMeshOrientations(
+        slabGeometry,
+        activeMeshZone.parameters,
+        activeMeshZone.geometry
+      ),
+    [activeMeshZone.geometry, activeMeshZone.parameters, slabGeometry]
+  );
 
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
@@ -652,7 +770,7 @@ export function StructureCanvas() {
 
     context.setTransform(1, 0, 0, 1, 0, 0);
     context.clearRect(0, 0, canvas.width, canvas.height);
-    context.fillStyle = "#ffffff";
+    context.fillStyle = cadCanvasBackground;
     context.fillRect(0, 0, canvas.width, canvas.height);
 
     if (!hasFitViewRef.current) {
@@ -686,28 +804,70 @@ export function StructureCanvas() {
     );
     drawDwgUnderlay(context, slabGeometry, scaleRef.current);
     drawStructuralBackground(context, slabGeometry, scaleRef.current);
-    drawMeshSheets(
-      context,
-      slabGeometry,
-      meshZones,
-      activeZoneId,
-      scaleRef.current
-    );
-    drawSlabGeometry(context, slabGeometry, scaleRef.current);
-    drawGridOriginMarker(
-      context,
-      slabGeometry,
-      activeMeshZone.parameters,
-      scaleRef.current
-    );
-    drawMeshDetailCallout(
-      context,
-      slabGeometry,
-      activeMeshZone.parameters,
-      scaleRef.current
-    );
+    if (slabGeometry.hasActiveSlabBoundary ?? true) {
+      if (slabGeometry.dwgUnderlay?.reviewOnly) {
+        drawZoneDraft(context, zoneDraftRef.current, scaleRef.current);
+        return;
+      }
+
+      drawMeshSheets(
+        context,
+        slabGeometry,
+        meshZones,
+        activeZoneId,
+        scaleRef.current
+      );
+      drawSlabGeometry(context, slabGeometry, scaleRef.current);
+      drawGridOriginMarker(
+        context,
+        slabGeometry,
+        activeMeshZone.parameters,
+        scaleRef.current
+      );
+      drawMeshDetailCallout(
+        context,
+        slabGeometry,
+        activeMeshZone.parameters,
+        scaleRef.current
+      );
+    }
     drawZoneDraft(context, zoneDraftRef.current, scaleRef.current);
   }, [activeMeshZone.parameters, activeZoneId, meshZones, slabGeometry]);
+
+  const zoomViewport = useCallback(
+    (factor: number) => {
+      const canvas = canvasRef.current;
+
+      if (!canvas) {
+        return;
+      }
+
+      const centerX = canvas.width / 2;
+      const centerY = canvas.height / 2;
+      const worldCenter = {
+        x: (centerX - panRef.current.x) / scaleRef.current,
+        y: (centerY - panRef.current.y) / scaleRef.current
+      };
+      const nextScale = Math.max(
+        minimumScale,
+        Math.min(maximumScale, scaleRef.current * factor)
+      );
+
+      scaleRef.current = nextScale;
+      panRef.current = {
+        x: centerX - worldCenter.x * nextScale,
+        y: centerY - worldCenter.y * nextScale
+      };
+      setViewScale(nextScale);
+      renderCanvas();
+    },
+    [renderCanvas]
+  );
+
+  const fitViewport = useCallback(() => {
+    hasFitViewRef.current = false;
+    renderCanvas();
+  }, [renderCanvas]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -730,6 +890,10 @@ export function StructureCanvas() {
       resizeObserver.disconnect();
     };
   }, []);
+
+  useEffect(() => {
+    hasFitViewRef.current = false;
+  }, [slabGeometry.boundary]);
 
   useEffect(() => {
     renderCanvas();
@@ -909,7 +1073,55 @@ export function StructureCanvas() {
   ]);
 
   return (
-    <div className="relative h-full min-h-[620px] overflow-hidden rounded-xl border bg-white">
+    <div className="relative h-full overflow-hidden bg-[#121214]">
+      <div className="absolute left-1/2 top-4 z-10 flex -translate-x-1/2 items-center gap-4 rounded-full border bg-background/80 px-4 py-2 text-xs text-foreground shadow-lg backdrop-blur">
+        <div className="flex items-center gap-1">
+          <button
+            className="rounded-md border px-2 py-1 text-sm leading-none transition hover:bg-muted"
+            type="button"
+            onClick={() => zoomViewport(0.88)}
+          >
+            -
+          </button>
+          <span className="min-w-14 text-center text-muted-foreground">
+            {Math.round(viewScale * 100)}%
+          </span>
+          <button
+            className="rounded-md border px-2 py-1 text-sm leading-none transition hover:bg-muted"
+            type="button"
+            onClick={() => zoomViewport(1.14)}
+          >
+            +
+          </button>
+        </div>
+        <button
+          className="rounded-md border px-3 py-1 font-medium transition hover:bg-muted"
+          type="button"
+          onClick={fitViewport}
+        >
+          Fit
+        </button>
+        <div className="flex items-center gap-1">
+          <span className="text-muted-foreground">ECO</span>
+          {(["horizontal", "vertical"] as const).map((orientation) => (
+            <button
+              key={orientation}
+              className={`rounded-md border px-2 py-1 font-medium transition ${
+                activeMeshZone.parameters.orientation === orientation
+                  ? "border-primary bg-primary/15 text-primary"
+                  : "hover:bg-muted"
+              }`}
+              type="button"
+              onClick={() => updateActiveMeshZoneParameters({ orientation })}
+            >
+              {orientation === "horizontal" ? "H" : "V"}
+              {layoutComparison.recommendedOrientation === orientation ? (
+                <span className="ml-1 text-[10px] text-sky-300">Eco</span>
+              ) : null}
+            </button>
+          ))}
+        </div>
+      </div>
       <div
         ref={containerRef}
         className={`h-full w-full touch-none ${
@@ -923,12 +1135,8 @@ export function StructureCanvas() {
           width={canvasSize.width}
         />
       </div>
-      <div className="pointer-events-none absolute left-4 top-4 rounded-md border bg-white/90 px-3 py-2 text-xs text-muted-foreground shadow-sm">
-        CAD viewport | mm model-space drawing | zoom camera only | DWG
-        underlay + mesh layout + detail callouts
-      </div>
       {isDrawingZone ? (
-        <div className="pointer-events-none absolute left-1/2 top-20 max-w-md -translate-x-1/2 rounded-md border border-blue-200 bg-blue-50 px-4 py-2 text-sm font-medium text-blue-900 shadow-sm">
+        <div className="pointer-events-none absolute left-1/2 top-20 z-10 max-w-md -translate-x-1/2 rounded-md border border-primary/30 bg-background/90 px-4 py-2 text-sm font-medium text-primary shadow-sm backdrop-blur">
           לחץ וגרור עם העכבר כדי להגדיר את שטח הרשת החדשה
         </div>
       ) : null}

@@ -10,6 +10,10 @@ import {
 } from "react";
 
 import { mockMeshZones, mockSlabGeometry } from "@/data/mockStructureData";
+import {
+  slabGeometryFromBoundaryLayer,
+  slabGeometryFromVisibleUnderlayLayers
+} from "@/lib/dxf-parser";
 import { compareBaseMeshOrientations } from "@/lib/geometry/mesh-sheet-layout";
 import type {
   BaseMeshSettings,
@@ -29,7 +33,11 @@ type ReinforcementContextValue = {
   beginDrawingZone: () => void;
   cancelDrawingZone: () => void;
   commitDrawnMeshZone: (geometry: MeshZone["geometry"]) => void;
+  importSlabGeometry: (slabGeometry: SlabGeometry) => void;
+  generateSlabFromVisibleLayers: () => boolean;
+  selectSlabBoundaryLayer: (layerName: string) => boolean;
   setActiveZoneId: (zoneId: string) => void;
+  setUnderlayLayerVisible: (layerName: string, visible: boolean) => void;
   updateActiveMeshZone: (patch: MeshZoneUpdate) => void;
   updateActiveMeshZoneParameters: (patch: BaseMeshSettingsUpdate) => void;
   resetToMockData: () => void;
@@ -83,6 +91,23 @@ function createDrawnZone(
     parameters: {
       ...baseParameters,
       diameter: 12,
+      gridOffsetX: 0,
+      gridOffsetY: 0
+    }
+  });
+}
+
+function createMainZoneForSlab(
+  slabGeometry: SlabGeometry,
+  baseParameters: BaseMeshSettings
+): MeshZone {
+  return withRecommendedZoneOrientation(slabGeometry, {
+    id: "ZONE-MAIN",
+    name: "אזור ראשי",
+    isMainZone: true,
+    geometry: slabGeometry.boundary,
+    parameters: {
+      ...baseParameters,
       gridOffsetX: 0,
       gridOffsetY: 0
     }
@@ -164,6 +189,87 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     [activeMeshZone.parameters, slabGeometry]
   );
 
+  const importSlabGeometry = useCallback(
+    (nextSlabGeometry: SlabGeometry) => {
+      const baseParameters = activeMeshZone.parameters;
+      const nextMainZone = createMainZoneForSlab(
+        nextSlabGeometry,
+        baseParameters
+      );
+
+      setSlabGeometry(nextSlabGeometry);
+      setMeshZones([nextMainZone]);
+      setActiveZoneId(nextMainZone.id);
+      setIsDrawingZone(false);
+    },
+    [activeMeshZone.parameters]
+  );
+
+  const selectSlabBoundaryLayer = useCallback(
+    (layerName: string) => {
+      const nextSlabGeometry = slabGeometryFromBoundaryLayer(
+        slabGeometry,
+        layerName
+      );
+
+      if (!nextSlabGeometry) {
+        return false;
+      }
+
+      const nextMainZone = createMainZoneForSlab(
+        nextSlabGeometry,
+        activeMeshZone.parameters
+      );
+
+      setSlabGeometry(nextSlabGeometry);
+      setMeshZones([nextMainZone]);
+      setActiveZoneId(nextMainZone.id);
+      setIsDrawingZone(false);
+      return true;
+    },
+    [activeMeshZone.parameters, slabGeometry]
+  );
+
+  const generateSlabFromVisibleLayers = useCallback(() => {
+    const nextSlabGeometry = slabGeometryFromVisibleUnderlayLayers(slabGeometry);
+
+    if (!nextSlabGeometry) {
+      return false;
+    }
+
+    const nextMainZone = createMainZoneForSlab(
+      nextSlabGeometry,
+      activeMeshZone.parameters
+    );
+
+    setSlabGeometry(nextSlabGeometry);
+    setMeshZones([nextMainZone]);
+    setActiveZoneId(nextMainZone.id);
+    setIsDrawingZone(false);
+    return true;
+  }, [activeMeshZone.parameters, slabGeometry]);
+
+  const setUnderlayLayerVisible = useCallback(
+    (layerName: string, visible: boolean) => {
+      setSlabGeometry((current) => {
+        if (!current.dwgUnderlay?.layers) {
+          return current;
+        }
+
+        return {
+          ...current,
+          dwgUnderlay: {
+            ...current.dwgUnderlay,
+            layers: current.dwgUnderlay.layers.map((layer) =>
+              layer.name === layerName ? { ...layer, visible } : layer
+            )
+          }
+        };
+      });
+    },
+    []
+  );
+
   const resetToMockData = useCallback(() => {
     const nextSlabGeometry = cloneSlabGeometry();
     const nextZones = cloneMeshZones().map((zone) =>
@@ -197,7 +303,11 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       beginDrawingZone,
       cancelDrawingZone,
       commitDrawnMeshZone,
+      generateSlabFromVisibleLayers,
+      importSlabGeometry,
+      selectSlabBoundaryLayer,
       setActiveZoneId,
+      setUnderlayLayerVisible,
       updateActiveMeshZone,
       updateActiveMeshZoneParameters,
       resetToMockData,
@@ -212,6 +322,10 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       beginDrawingZone,
       cancelDrawingZone,
       commitDrawnMeshZone,
+      generateSlabFromVisibleLayers,
+      importSlabGeometry,
+      selectSlabBoundaryLayer,
+      setUnderlayLayerVisible,
       updateActiveMeshZone,
       updateActiveMeshZoneParameters,
       resetToMockData,

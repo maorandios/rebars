@@ -23,7 +23,52 @@ export type CadTextEntity = {
   text: string;
 };
 
+export type CadCircleEntity = {
+  id: string;
+  layer: string;
+  center: Point;
+  color?: string;
+  lineWeightPx?: number;
+  radius: number;
+};
+
+export type CadArcEntity = {
+  id: string;
+  layer: string;
+  center: Point;
+  color?: string;
+  endAngle: number;
+  lineWeightPx?: number;
+  radius: number;
+  startAngle: number;
+};
+
+export type DwgUnderlayLayer = {
+  entityCount: number;
+  name: string;
+  visible: boolean;
+};
+
+export type CadClosedPolylineCandidate = {
+  area: number;
+  id: string;
+  layer: string;
+  polygon: Polygon;
+};
+
 export type DwgUnderlay = {
+  arcs?: CadArcEntity[];
+  bounds?: {
+    maxX: number;
+    maxY: number;
+    minX: number;
+    minY: number;
+  };
+  circles?: CadCircleEntity[];
+  closedPolylines?: CadClosedPolylineCandidate[];
+  importedFileName?: string;
+  reviewOnly?: boolean;
+  layers?: DwgUnderlayLayer[];
   lines: CadLineEntity[];
   texts: CadTextEntity[];
 };
@@ -46,6 +91,7 @@ export type StructuralElement = {
 
 export type SlabGeometry = {
   boundary: Polygon;
+  hasActiveSlabBoundary?: boolean;
   meshBoundary?: Polygon;
   meshInteriorBoundary?: Polygon;
   dwgUnderlay?: DwgUnderlay;
