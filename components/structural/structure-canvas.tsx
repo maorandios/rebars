@@ -46,12 +46,17 @@ const meshBlue = "#0ea5e9";
 const meshActiveBlue = "#38bdf8";
 const canvasText = "#f4f4f5";
 const canvasMutedText = "#d4d4d8";
+const calculatedSlabLayer = "CALCULATED-SLAB";
 
 type ZoneDraft = {
   current: Point;
   isDragging: boolean;
   start: Point;
 };
+
+function distance(a: Point, b: Point) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
 
 function screenPx(value: number, scale: number) {
   return value / scale;
@@ -70,6 +75,34 @@ function drawPolygonPath(context: CanvasRenderingContext2D, polygon: Polygon) {
   }
 
   context.closePath();
+}
+
+function appendPolygonPath(context: CanvasRenderingContext2D, polygon: Polygon) {
+  if (polygon.length === 0) {
+    return;
+  }
+
+  context.moveTo(polygon[0].x, polygon[0].y);
+
+  for (const point of polygon.slice(1)) {
+    context.lineTo(point.x, point.y);
+  }
+
+  context.closePath();
+}
+
+function clipToSlabBoundary(
+  context: CanvasRenderingContext2D,
+  slabGeometry: SlabGeometry
+) {
+  context.beginPath();
+  appendPolygonPath(context, slabGeometry.boundary);
+
+  for (const opening of slabGeometry.openings) {
+    appendPolygonPath(context, opening.polygon);
+  }
+
+  context.clip("evenodd");
 }
 
 function drawPolylinePath(
@@ -140,14 +173,29 @@ function drawText(
     rotation?: number;
   } = {}
 ) {
+  const lines = text.split("\n");
+  const height = options.height ?? cadTextHeight.label;
+  const lineHeight = height * 1.15;
+  const baseline = options.baseline ?? "middle";
+  const startY =
+    baseline === "top"
+      ? 0
+      : baseline === "bottom"
+        ? -(lines.length - 1) * lineHeight
+        : baseline === "alphabetic"
+          ? -(lines.length - 1) * lineHeight
+          : -((lines.length - 1) * lineHeight) / 2;
+
   context.save();
   context.translate(x, y);
   context.rotate(options.rotation ?? 0);
-  context.font = `${options.height ?? cadTextHeight.label}px Consolas, "Courier New", monospace`;
+  context.font = `${height}px Consolas, "Courier New", monospace`;
   context.fillStyle = options.color ?? canvasText;
   context.textAlign = options.align ?? "center";
-  context.textBaseline = options.baseline ?? "middle";
-  context.fillText(text, 0, 0);
+  context.textBaseline = baseline;
+  lines.forEach((line, index) => {
+    context.fillText(line, 0, startY + index * lineHeight);
+  });
   context.restore();
 }
 
@@ -172,6 +220,8 @@ function drawCadText(
   scale: number
 ) {
   drawText(context, text.text, text.position.x, text.position.y, scale, {
+    align: text.align,
+    baseline: text.baseline,
     color: text.color ?? canvasMutedText,
     height: text.heightPx ?? cadTextHeight.small,
     rotation: text.rotation,
@@ -224,6 +274,14 @@ function visibleUnderlayLayers(slabGeometry: SlabGeometry) {
 
 function isLayerVisible(visibleLayers: Set<string>, layer: string) {
   return visibleLayers.has(layer);
+}
+
+function isCalculatedSlabVisible(slabGeometry: SlabGeometry) {
+  const calculatedLayer = slabGeometry.dwgUnderlay?.layers?.find(
+    (layer) => layer.name === calculatedSlabLayer
+  );
+
+  return calculatedLayer?.visible ?? true;
 }
 
 function drawOpening(
@@ -360,9 +418,15 @@ function drawSlabGeometry(
   scale: number
 ) {
   const bounds = polygonBounds(slabGeometry.boundary);
+  const isImportedWorkingSlab = Boolean(
+    slabGeometry.dwgUnderlay && !slabGeometry.dwgUnderlay.reviewOnly
+  );
 
   drawPolygonPath(context, slabGeometry.boundary);
-  setDraftStroke(context, scale, { color: "#a1a1aa", widthPx: 1.5 });
+  setDraftStroke(context, scale, {
+    color: isImportedWorkingSlab ? meshActiveBlue : "#a1a1aa",
+    widthPx: isImportedWorkingSlab ? 2.2 : 1.5
+  });
   context.stroke();
   resetDraftStroke(context);
 
@@ -464,6 +528,9 @@ function drawMeshSheets(
   activeZoneId: string,
   scale: number
 ) {
+  context.save();
+  clipToSlabBoundary(context, slabGeometry);
+
   for (const [index, zone] of meshZones.entries()) {
     const exclusionPolygons = meshZones
       .slice(index + 1)
@@ -481,6 +548,8 @@ function drawMeshSheets(
       drawMeshSheet(context, sheet, scale, opacity, isActive);
     }
   }
+
+  context.restore();
 }
 
 function gridOriginPoint(
@@ -724,10 +793,82 @@ function drawZoneDraft(
   resetDraftStroke(context);
 }
 
+function drawBoundaryTrace(
+  context: CanvasRenderingContext2D,
+  points: Point[],
+  snapPoint: Point | null,
+  scale: number
+) {
+  if (points.length > 0) {
+    context.beginPath();
+    context.moveTo(points[0].x, points[0].y);
+
+    for (const point of points.slice(1)) {
+      context.lineTo(point.x, point.y);
+    }
+
+    if (snapPoint) {
+      context.lineTo(snapPoint.x, snapPoint.y);
+    }
+
+    setDraftStroke(context, scale, {
+      color: "#f4f4f5",
+      dash: [12, 8],
+      widthPx: 2
+    });
+    context.stroke();
+    resetDraftStroke(context);
+  }
+
+  for (const point of points) {
+    context.beginPath();
+    context.arc(point.x, point.y, screenPx(5, scale), 0, Math.PI * 2);
+    context.fillStyle = "#f4f4f5";
+    context.fill();
+  }
+
+  if (snapPoint) {
+    context.beginPath();
+    context.arc(snapPoint.x, snapPoint.y, screenPx(7, scale), 0, Math.PI * 2);
+    context.fillStyle = meshActiveBlue;
+    context.fill();
+  }
+}
+
+function drawBoundaryEditHandles(
+  context: CanvasRenderingContext2D,
+  boundary: Polygon,
+  scale: number
+) {
+  if (boundary.length === 0) {
+    return;
+  }
+
+  drawPolylinePath(context, [...boundary, boundary[0]]);
+  setDraftStroke(context, scale, {
+    color: meshActiveBlue,
+    dash: [8, 6],
+    widthPx: 1.8
+  });
+  context.stroke();
+  resetDraftStroke(context);
+
+  for (const [index, point] of boundary.entries()) {
+    context.beginPath();
+    context.arc(point.x, point.y, screenPx(7, scale), 0, Math.PI * 2);
+    context.fillStyle = index === 0 ? "#f4f4f5" : meshActiveBlue;
+    context.fill();
+    context.strokeStyle = "#020617";
+    context.lineWidth = screenPx(2, scale);
+    context.stroke();
+  }
+}
+
 export function StructureCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const zoneDraftRef = useRef<ZoneDraft | null>(null);
+  const editingVertexIndexRef = useRef<number | null>(null);
   const hasFitViewRef = useRef(false);
   const panRef = useRef({ x: canvasPadding, y: canvasPadding });
   const scaleRef = useRef(initialScale);
@@ -740,14 +881,21 @@ export function StructureCanvas() {
   });
   const [viewScale, setViewScale] = useState(initialScale);
   const [canvasSize, setCanvasSize] = useState({ height: 1, width: 1 });
+  const [snapPoint, setSnapPoint] = useState<Point | null>(null);
   const {
     slabGeometry,
     meshZones,
     activeZoneId,
     activeMeshZone,
     isDrawingZone,
+    isDrawingBoundary,
+    isEditingBoundary,
+    boundaryDraftPoints,
+    addBoundaryTracePoint,
     cancelDrawingZone,
     commitDrawnMeshZone,
+    finishBoundaryTrace,
+    updateCalculatedBoundaryPoint,
     updateActiveMeshZoneParameters
   } = useReinforcement();
   const layoutComparison = useMemo(
@@ -806,6 +954,12 @@ export function StructureCanvas() {
     drawStructuralBackground(context, slabGeometry, scaleRef.current);
     if (slabGeometry.hasActiveSlabBoundary ?? true) {
       if (slabGeometry.dwgUnderlay?.reviewOnly) {
+        drawBoundaryTrace(
+          context,
+          boundaryDraftPoints,
+          snapPoint,
+          scaleRef.current
+        );
         drawZoneDraft(context, zoneDraftRef.current, scaleRef.current);
         return;
       }
@@ -817,7 +971,16 @@ export function StructureCanvas() {
         activeZoneId,
         scaleRef.current
       );
-      drawSlabGeometry(context, slabGeometry, scaleRef.current);
+      if (isCalculatedSlabVisible(slabGeometry) || isEditingBoundary) {
+        drawSlabGeometry(context, slabGeometry, scaleRef.current);
+      }
+      if (isEditingBoundary) {
+        drawBoundaryEditHandles(
+          context,
+          slabGeometry.boundary,
+          scaleRef.current
+        );
+      }
       drawGridOriginMarker(
         context,
         slabGeometry,
@@ -831,8 +994,17 @@ export function StructureCanvas() {
         scaleRef.current
       );
     }
+    drawBoundaryTrace(context, boundaryDraftPoints, snapPoint, scaleRef.current);
     drawZoneDraft(context, zoneDraftRef.current, scaleRef.current);
-  }, [activeMeshZone.parameters, activeZoneId, meshZones, slabGeometry]);
+  }, [
+    activeMeshZone.parameters,
+    activeZoneId,
+    boundaryDraftPoints,
+    isEditingBoundary,
+    meshZones,
+    slabGeometry,
+    snapPoint
+  ]);
 
   const zoomViewport = useCallback(
     (factor: number) => {
@@ -892,8 +1064,10 @@ export function StructureCanvas() {
   }, []);
 
   useEffect(() => {
-    hasFitViewRef.current = false;
-  }, [slabGeometry.boundary]);
+    if (!isEditingBoundary) {
+      hasFitViewRef.current = false;
+    }
+  }, [isEditingBoundary, slabGeometry.boundary]);
 
   useEffect(() => {
     renderCanvas();
@@ -915,6 +1089,41 @@ export function StructureCanvas() {
         x: (localX - panRef.current.x) / scaleRef.current,
         y: (localY - panRef.current.y) / scaleRef.current
       };
+    };
+
+    const snapToDxfVertex = (worldPoint: Point) => {
+      const snapRadius = screenPx(15, scaleRef.current);
+      const vertices = slabGeometry.dwgUnderlay?.dxfVertices ?? [];
+      let closest: Point | null = null;
+      let closestDistance = Number.POSITIVE_INFINITY;
+
+      for (const vertex of vertices) {
+        const nextDistance = distance(worldPoint, vertex);
+
+        if (nextDistance < closestDistance) {
+          closest = vertex;
+          closestDistance = nextDistance;
+        }
+      }
+
+      return closest && closestDistance <= snapRadius ? closest : null;
+    };
+
+    const boundaryVertexAt = (worldPoint: Point) => {
+      const hitRadius = screenPx(12, scaleRef.current);
+      let closestIndex: number | null = null;
+      let closestDistance = Number.POSITIVE_INFINITY;
+
+      for (const [index, vertex] of slabGeometry.boundary.entries()) {
+        const nextDistance = distance(worldPoint, vertex);
+
+        if (nextDistance < closestDistance) {
+          closestIndex = index;
+          closestDistance = nextDistance;
+        }
+      }
+
+      return closestDistance <= hitRadius ? closestIndex : null;
     };
 
     const handleWheel = (event: WheelEvent) => {
@@ -986,10 +1195,69 @@ export function StructureCanvas() {
         return;
       }
 
+      if (isEditingBoundary) {
+        if (event.button !== 0) {
+          return;
+        }
+
+        const vertexIndex = boundaryVertexAt(eventToWorldPoint(event));
+
+        if (vertexIndex === null) {
+          return;
+        }
+
+        try {
+          container.setPointerCapture(event.pointerId);
+        } catch {
+          // Synthetic/test pointer events may not have an active pointer capture.
+        }
+
+        editingVertexIndexRef.current = vertexIndex;
+        return;
+      }
+
+      if (isDrawingBoundary) {
+        if (event.button !== 0) {
+          return;
+        }
+
+        const snappedPoint = snapToDxfVertex(eventToWorldPoint(event));
+
+        if (!snappedPoint) {
+          return;
+        }
+
+        const firstPoint = boundaryDraftPoints[0];
+
+        if (
+          firstPoint &&
+          boundaryDraftPoints.length >= 3 &&
+          distance(firstPoint, snappedPoint) <= screenPx(15, scaleRef.current)
+        ) {
+          finishBoundaryTrace();
+          setSnapPoint(null);
+        } else {
+          addBoundaryTracePoint(snappedPoint);
+          setSnapPoint(snappedPoint);
+        }
+
+        renderCanvas();
+        return;
+      }
+
       // Left click is reserved for future picking; zone selection stays sidebar-only.
     };
 
     const handlePointerMove = (event: PointerEvent) => {
+      if (editingVertexIndexRef.current !== null) {
+        const worldPoint = eventToWorldPoint(event);
+        const nextPoint = snapToDxfVertex(worldPoint) ?? worldPoint;
+
+        updateCalculatedBoundaryPoint(editingVertexIndexRef.current, nextPoint);
+        renderCanvas();
+        return;
+      }
+
       if (isDrawingZone && zoneDraftRef.current?.isDragging) {
         zoneDraftRef.current = {
           ...zoneDraftRef.current,
@@ -999,18 +1267,34 @@ export function StructureCanvas() {
         return;
       }
 
-      if (!dragRef.current.isDragging) {
+      if (dragRef.current.isDragging) {
+        panRef.current = {
+          x: dragRef.current.panX + event.clientX - dragRef.current.startX,
+          y: dragRef.current.panY + event.clientY - dragRef.current.startY
+        };
+        renderCanvas();
         return;
       }
 
-      panRef.current = {
-        x: dragRef.current.panX + event.clientX - dragRef.current.startX,
-        y: dragRef.current.panY + event.clientY - dragRef.current.startY
-      };
-      renderCanvas();
+      if (isDrawingBoundary) {
+        setSnapPoint(snapToDxfVertex(eventToWorldPoint(event)));
+        renderCanvas();
+      }
     };
 
     const handlePointerUp = (event: PointerEvent) => {
+      if (editingVertexIndexRef.current !== null) {
+        editingVertexIndexRef.current = null;
+
+        try {
+          container.releasePointerCapture(event.pointerId);
+        } catch {
+          // Pointer capture may not exist for synthetic/test events.
+        }
+        renderCanvas();
+        return;
+      }
+
       if (isDrawingZone && zoneDraftRef.current?.isDragging) {
         const draft = zoneDraftRef.current;
         const width = Math.abs(draft.current.x - draft.start.x);
@@ -1065,19 +1349,31 @@ export function StructureCanvas() {
       container.removeEventListener("pointercancel", handlePointerUp);
     };
   }, [
+    addBoundaryTracePoint,
+    boundaryDraftPoints,
     cancelDrawingZone,
     commitDrawnMeshZone,
+    finishBoundaryTrace,
+    isDrawingBoundary,
+    isEditingBoundary,
     isDrawingZone,
     meshZones,
-    renderCanvas
+    slabGeometry.boundary,
+    slabGeometry.dwgUnderlay?.dxfVertices,
+    renderCanvas,
+    updateCalculatedBoundaryPoint
   ]);
 
   return (
     <div className="relative h-full overflow-hidden bg-[#121214]">
-      <div className="absolute left-1/2 top-4 z-10 flex -translate-x-1/2 items-center gap-4 rounded-full border bg-background/80 px-4 py-2 text-xs text-foreground shadow-lg backdrop-blur">
+      <div
+        className="absolute left-1/2 top-4 z-10 flex -translate-x-1/2 items-center gap-4 rounded-full border bg-background/80 px-4 py-2 text-xs text-foreground shadow-lg backdrop-blur"
+        suppressHydrationWarning
+      >
         <div className="flex items-center gap-1">
           <button
             className="rounded-md border px-2 py-1 text-sm leading-none transition hover:bg-muted"
+            suppressHydrationWarning
             type="button"
             onClick={() => zoomViewport(0.88)}
           >
@@ -1088,6 +1384,7 @@ export function StructureCanvas() {
           </span>
           <button
             className="rounded-md border px-2 py-1 text-sm leading-none transition hover:bg-muted"
+            suppressHydrationWarning
             type="button"
             onClick={() => zoomViewport(1.14)}
           >
@@ -1096,6 +1393,7 @@ export function StructureCanvas() {
         </div>
         <button
           className="rounded-md border px-3 py-1 font-medium transition hover:bg-muted"
+          suppressHydrationWarning
           type="button"
           onClick={fitViewport}
         >
@@ -1111,6 +1409,7 @@ export function StructureCanvas() {
                   ? "border-primary bg-primary/15 text-primary"
                   : "hover:bg-muted"
               }`}
+              suppressHydrationWarning
               type="button"
               onClick={() => updateActiveMeshZoneParameters({ orientation })}
             >
@@ -1125,7 +1424,9 @@ export function StructureCanvas() {
       <div
         ref={containerRef}
         className={`h-full w-full touch-none ${
-          isDrawingZone ? "cursor-crosshair" : "cursor-default"
+          isDrawingZone || isDrawingBoundary || isEditingBoundary
+            ? "cursor-crosshair"
+            : "cursor-default"
         }`}
       >
         <canvas
@@ -1138,6 +1439,24 @@ export function StructureCanvas() {
       {isDrawingZone ? (
         <div className="pointer-events-none absolute left-1/2 top-20 z-10 max-w-md -translate-x-1/2 rounded-md border border-primary/30 bg-background/90 px-4 py-2 text-sm font-medium text-primary shadow-sm backdrop-blur">
           לחץ וגרור עם העכבר כדי להגדיר את שטח הרשת החדשה
+        </div>
+      ) : null}
+      {isDrawingBoundary ? (
+        <div className="pointer-events-none absolute left-1/2 top-20 z-10 flex max-w-md -translate-x-1/2 items-center gap-3 rounded-md border border-primary/30 bg-background/90 px-4 py-2 text-sm font-medium text-primary shadow-sm backdrop-blur">
+          <span>לחץ על נקודות DXF כדי להגדיר את גבול התקרה</span>
+          <button
+            className="pointer-events-auto rounded-md border px-2 py-1 text-xs"
+            suppressHydrationWarning
+            type="button"
+            onClick={finishBoundaryTrace}
+          >
+            סיום הגדרה
+          </button>
+        </div>
+      ) : null}
+      {isEditingBoundary ? (
+        <div className="pointer-events-none absolute left-1/2 top-20 z-10 max-w-md -translate-x-1/2 rounded-md border border-primary/30 bg-background/90 px-4 py-2 text-sm font-medium text-primary shadow-sm backdrop-blur">
+          Drag blue boundary points to adjust the calculated slab
         </div>
       ) : null}
     </div>

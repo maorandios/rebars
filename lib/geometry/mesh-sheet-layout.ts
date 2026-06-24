@@ -201,6 +201,10 @@ function interpolateBoundary(
 }
 
 function getOuterCoverBoundary(slabGeometry: SlabGeometry) {
+  if (slabGeometry.dwgUnderlay && !slabGeometry.dwgUnderlay.reviewOnly) {
+    return slabGeometry.meshBoundary ?? slabGeometry.boundary;
+  }
+
   return (
     slabGeometry.meshBoundary ??
     applyConcreteCoverToBoundary(slabGeometry.boundary, slabGeometry.concreteCover)
@@ -531,9 +535,33 @@ function generateLayoutForOrientation(
   exclusionPolygons: Polygon[] = []
 ): MeshSheetLayoutResult {
   const placementBoundary = getMeshPlacementBoundary(slabGeometry, settings);
+  const emptyResult: MeshSheetLayoutResult = {
+    sheets: [],
+    discardedCount: 0,
+    requestedOrientation: settings.orientation,
+    selectedOrientation: settings.orientation,
+    sheetCount: 0,
+    rawSheetArea: 0,
+    visibleArea: 0,
+    cutWasteArea: 0,
+    optimizedOverlapX: settings.overlapX,
+    optimizedOverlapY: settings.overlapY,
+    stepX: Math.max(1, settings.sheetWidth - settings.overlapX),
+    stepY: Math.max(1, settings.sheetLength - settings.overlapY)
+  };
+
+  if (placementBoundary.length < 3) {
+    return emptyResult;
+  }
+
   const layoutBoundary = zoneGeometry
     ? intersectPolygons(placementBoundary, zoneGeometry)[0] ?? placementBoundary
     : placementBoundary;
+
+  if (layoutBoundary.length < 3) {
+    return emptyResult;
+  }
+
   const originBoundary = getGridOriginBoundary(slabGeometry);
   const candidateLayout = generateSheetCandidates(
     polygonBounds(layoutBoundary),

@@ -82,7 +82,8 @@ const slabRejectLayerPattern =
   /(IDEN|TEXT|DIM|ANNO|GRID|AXIS|WALL|DETAIL|DETL|SYMB|SYMBOL|HATCH|FURN|DOOR|WINDOW)/i;
 const primaryModelBoundsRejectPattern =
   /(IDEN|TEXT|DIM|ANNO|GRID|AXIS|DETAIL|DETL|SYMB|SYMBOL|HATCH|FURN|DOOR|WINDOW)/i;
-const duplicatePointTolerance = 5;
+const dxfUnitToMillimeters = 10;
+const duplicatePointTolerance = 5 * dxfUnitToMillimeters;
 const syntheticClosedNodesLayer = "AUTO-CLOSED-NODES";
 const syntheticFinalSlabLayer = "WORKING-SLAB";
 const arcSegmentLength = 750;
@@ -93,9 +94,13 @@ function entityId(entity: IEntity, fallback: number) {
 
 function toPoint(point: IPoint): { x: number; y: number } {
   return {
-    x: point.x,
-    y: -point.y
+    x: point.x * dxfUnitToMillimeters,
+    y: -point.y * dxfUnitToMillimeters
   };
+}
+
+function toMillimeters(value: number) {
+  return value * dxfUnitToMillimeters;
 }
 
 function isFinitePoint(point: { x: number; y: number }) {
@@ -171,6 +176,62 @@ function textRotation(rotation: number | undefined) {
   return -normalizeAngle(rotation);
 }
 
+function textRotationFromDirectionVector(vector: IPoint | undefined) {
+  if (!vector || (!Number.isFinite(vector.x) && !Number.isFinite(vector.y))) {
+    return 0;
+  }
+
+  return -Math.atan2(vector.y ?? 0, vector.x ?? 1);
+}
+
+function textInsertionPoint(text: ITextEntity) {
+  const usesAlignmentPoint = Boolean((text.halign || text.valign) && text.endPoint);
+
+  return toPoint(usesAlignmentPoint ? text.endPoint : text.startPoint);
+}
+
+function textHorizontalAlign(halign: number | undefined): CanvasTextAlign {
+  if (halign === 1 || halign === 4) {
+    return "center";
+  }
+
+  if (halign === 2) {
+    return "right";
+  }
+
+  return "left";
+}
+
+function textVerticalBaseline(valign: number | undefined): CanvasTextBaseline {
+  if (valign === 1) {
+    return "bottom";
+  }
+
+  if (valign === 2) {
+    return "middle";
+  }
+
+  if (valign === 3) {
+    return "top";
+  }
+
+  return "alphabetic";
+}
+
+function mtextAnchor(attachmentPoint: number | undefined): {
+  align: CanvasTextAlign;
+  baseline: CanvasTextBaseline;
+} {
+  const attachment = attachmentPoint ?? 1;
+  const column = ((attachment - 1) % 3) + 1;
+  const row = Math.floor((attachment - 1) / 3) + 1;
+
+  return {
+    align: column === 1 ? "left" : column === 2 ? "center" : "right",
+    baseline: row === 1 ? "top" : row === 2 ? "middle" : "bottom"
+  };
+}
+
 function formatDimensionMeasurement(value: number | undefined) {
   if (!Number.isFinite(value)) {
     return "";
@@ -182,7 +243,7 @@ function formatDimensionMeasurement(value: number | undefined) {
 }
 
 function textContent(text: string, dimensionMeasurement?: string) {
-  return text
+  const cleaned = text
     .replace(/%%[cC]/g, "Ø")
     .replace(/%%[dD]/g, "°")
     .replace(/%%[pP]/g, "±")
@@ -201,6 +262,8 @@ function textContent(text: string, dimensionMeasurement?: string) {
     .replace(/D=\n/g, "D=")
     .replace(/Ø\n/g, "Ø")
     .trim();
+
+  return cleaned.replace(/^(\d+(?:\.\d+)?)\n(\d+(?:\.\d+)?)$/, "$2/$1");
 }
 
 function isNearZeroRotation(rotation: number | undefined) {
@@ -452,8 +515,8 @@ function modelTextHeight(
   fallback = 100
 ) {
   return Number.isFinite(height) && height && height > 0
-    ? height * transform.scale
-    : fallback * transform.scale;
+    ? toMillimeters(height) * transform.scale
+    : toMillimeters(fallback) * transform.scale;
 }
 
 function isSlabSourceLayer(layer: string) {
@@ -533,7 +596,7 @@ function convertEntityToUnderlay(
       id,
       layer,
       lineWeightPx: 0.8,
-      radius: circle.radius * transform.scale
+      radius: toMillimeters(circle.radius) * transform.scale
     });
     return converted;
   }
@@ -556,10 +619,12 @@ function convertEntityToUnderlay(
     const text = entity as ITextEntity;
 
     converted.texts.push({
+      align: textHorizontalAlign(text.halign),
+      baseline: textVerticalBaseline(text.valign),
       heightPx: modelTextHeight(text.textHeight, transform),
       id,
       layer,
-      position: transform.transformPoint(toPoint(text.startPoint)),
+      position: transform.transformPoint(textInsertionPoint(text)),
       rotation: textRotation(text.rotation) + transform.rotation,
       text: textContent(text.text)
     });
@@ -568,13 +633,20 @@ function convertEntityToUnderlay(
 
   if (entity.type === "MTEXT") {
     const text = entity as IMtextEntity;
+    const anchor = mtextAnchor(text.attachmentPoint);
 
     converted.texts.push({
+      align: anchor.align,
+      baseline: anchor.baseline,
       heightPx: modelTextHeight(text.height, transform),
       id,
       layer,
       position: transform.transformPoint(toPoint(text.position)),
-      rotation: textRotation(text.rotation) + transform.rotation,
+      rotation:
+        (text.rotation
+          ? textRotation(text.rotation)
+          : textRotationFromDirectionVector(text.directionVector)) +
+        transform.rotation,
       text: textContent(text.text)
     });
     return converted;
@@ -585,6 +657,8 @@ function convertEntityToUnderlay(
 
     if (!text.invisible && text.text && text.startPoint) {
       converted.texts.push({
+        align: textHorizontalAlign(text.horizontalJustification),
+        baseline: textVerticalBaseline(text.verticalJustification),
         heightPx: modelTextHeight(text.textHeight, transform),
         id,
         layer,
@@ -753,6 +827,8 @@ function convertEntityToUnderlay(
 
     if (text && dimension.middleOfText) {
       converted.texts.push({
+        align: "center",
+        baseline: "middle",
         heightPx: modelTextHeight(undefined, transform),
         id: `${id}-TEXT`,
         layer,
@@ -812,6 +888,8 @@ function createUnderlay(
     });
   }
 
+  const dxfVertices = collectDxfVertices(lines);
+
   const layerCounts = createDxfLayerMap(dxf);
   const sourceLayerNames = new Set([
     ...Object.keys(dxf.tables?.layer?.layers ?? {}),
@@ -839,6 +917,7 @@ function createUnderlay(
       ...candidates.map(toCadClosedPolyline),
       ...(finalSlab ? [toCadClosedPolyline(finalSlab)] : [])
     ],
+    dxfVertices,
     importedFileName: fileName,
     layers: [...layerCounts.entries()]
       .map(([name, layer]) => ({
@@ -851,6 +930,29 @@ function createUnderlay(
     reviewOnly: true,
     texts
   };
+}
+
+function collectDxfVertices(lines: CadLineEntity[]) {
+  const vertices = new Map<string, { x: number; y: number }>();
+  const snapTolerance = 1;
+
+  for (const line of lines) {
+    for (const point of line.points) {
+      if (!isFinitePoint(point)) {
+        continue;
+      }
+
+      const key = `${Math.round(point.x / snapTolerance)}:${Math.round(
+        point.y / snapTolerance
+      )}`;
+
+      if (!vertices.has(key)) {
+        vertices.set(key, point);
+      }
+    }
+  }
+
+  return [...vertices.values()];
 }
 
 function createDxfLayerMap(dxf: IDxf) {
@@ -1349,6 +1451,7 @@ function segmentizeArc(arc: IArcEntity) {
   }
 
   const center = toPoint(arc.center);
+  const radius = toMillimeters(arc.radius);
   const startAngle = normalizeAngle(arc.startAngle);
   let endAngle = normalizeAngle(arc.endAngle);
 
@@ -1359,15 +1462,15 @@ function segmentizeArc(arc: IArcEntity) {
   const angleLength = Math.max(0, endAngle - startAngle);
   const segmentCount = Math.max(
     8,
-    Math.ceil((arc.radius * angleLength) / arcSegmentLength)
+    Math.ceil((radius * angleLength) / arcSegmentLength)
   );
 
   return Array.from({ length: segmentCount + 1 }, (_, index) => {
     const angle = startAngle + (angleLength * index) / segmentCount;
 
     return {
-      x: center.x + Math.cos(angle) * arc.radius,
-      y: center.y - Math.sin(angle) * arc.radius
+      x: center.x + Math.cos(angle) * radius,
+      y: center.y - Math.sin(angle) * radius
     };
   });
 }

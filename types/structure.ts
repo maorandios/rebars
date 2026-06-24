@@ -16,6 +16,8 @@ export type CadLineEntity = {
 export type CadTextEntity = {
   id: string;
   layer: string;
+  align?: CanvasTextAlign;
+  baseline?: CanvasTextBaseline;
   color?: string;
   heightPx?: number;
   position: Point;
@@ -68,6 +70,7 @@ export type DwgUnderlay = {
   closedPolylines?: CadClosedPolylineCandidate[];
   importedFileName?: string;
   reviewOnly?: boolean;
+  dxfVertices?: Point[];
   layers?: DwgUnderlayLayer[];
   lines: CadLineEntity[];
   texts: CadTextEntity[];

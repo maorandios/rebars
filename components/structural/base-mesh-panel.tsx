@@ -74,16 +74,30 @@ export function MeshZonesPanel() {
     meshZones,
     activeZoneId,
     isDrawingZone,
+    isDrawingBoundary,
+    isEditingBoundary,
+    boundaryDraftPoints,
+    activateBaseMeshOnWorkingSlab,
+    beginBoundaryEdit,
+    beginBoundaryTrace,
     beginDrawingZone,
+    cancelBoundaryTrace,
+    deleteCalculatedSlab,
+    finishBoundaryEdit,
+    finishBoundaryTrace,
     generateSlabFromVisibleLayers,
     importSlabGeometry,
     selectSlabBoundaryLayer,
+    setCalculatedSlabVisible,
     setUnderlayLayerVisible,
     setActiveZoneId
   } = useReinforcement();
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const underlay = slabGeometry.dwgUnderlay;
   const hasActiveSlabBoundary = slabGeometry.hasActiveSlabBoundary ?? true;
+  const calculatedSlabLayer = underlay?.layers?.find(
+    (layer) => layer.name === "CALCULATED-SLAB"
+  );
   const boundaryLayerOptions = useMemo(() => {
     const counts = new Map<string, number>();
 
@@ -223,6 +237,123 @@ export function MeshZonesPanel() {
                 בלחיצה בקנבס
               </div>
             ) : null}
+            <div className="mb-3 space-y-2">
+              <Button
+                className="w-full"
+                type="button"
+                variant={isDrawingBoundary ? "secondary" : "default"}
+                onClick={() => {
+                  beginBoundaryTrace();
+                  setUploadStatus(
+                    "Tracing mode active. Click snapped DXF vertices to define the slab perimeter."
+                  );
+                }}
+              >
+                הגדר גבול תקרה
+              </Button>
+              {isDrawingBoundary ? (
+                <div className="space-y-2 rounded-md border border-primary/30 bg-primary/10 p-2 text-xs leading-5 text-primary">
+                  <div>
+                    Boundary points: {boundaryDraftPoints.length}. Click DXF
+                    vertices to trace the slab.
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      className="h-8 flex-1"
+                      type="button"
+                      variant="secondary"
+                      onClick={() => {
+                        const didFinish = finishBoundaryTrace();
+
+                        setUploadStatus(
+                          didFinish
+                            ? "Calculated slab created from traced boundary."
+                            : "Pick at least 3 boundary points before finishing."
+                        );
+                      }}
+                    >
+                      סיום הגדרה
+                    </Button>
+                    <Button
+                      className="h-8 flex-1"
+                      type="button"
+                      variant="outline"
+                      onClick={() => {
+                        cancelBoundaryTrace();
+                        setUploadStatus("Boundary tracing cancelled.");
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+            {calculatedSlabLayer ? (
+              <div className="mb-3 space-y-2 rounded-md border border-sky-400/30 bg-sky-400/10 p-2 text-xs leading-5 text-sky-100">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <div className="font-medium text-foreground">
+                      CALCULATED-SLAB
+                    </div>
+                    <div className="text-muted-foreground">
+                      {slabGeometry.boundary.length} boundary points
+                    </div>
+                  </div>
+                  <Button
+                    className="h-8 px-2"
+                    type="button"
+                    variant={calculatedSlabLayer.visible ? "secondary" : "outline"}
+                    onClick={() => {
+                      setCalculatedSlabVisible(!calculatedSlabLayer.visible);
+                      setUploadStatus(
+                        calculatedSlabLayer.visible
+                          ? "Calculated slab layer hidden."
+                          : "Calculated slab layer visible."
+                      );
+                    }}
+                  >
+                    {calculatedSlabLayer.visible ? "Hide" : "Show"}
+                  </Button>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button
+                    className="h-8"
+                    type="button"
+                    variant={isEditingBoundary ? "secondary" : "outline"}
+                    onClick={() => {
+                      if (isEditingBoundary) {
+                        finishBoundaryEdit();
+                        setUploadStatus("Boundary point edit mode finished.");
+                      } else {
+                        beginBoundaryEdit();
+                        setUploadStatus(
+                          "Boundary point edit mode active. Drag blue vertices on the canvas."
+                        );
+                      }
+                    }}
+                  >
+                    {isEditingBoundary ? "Done Edit" : "Edit Points"}
+                  </Button>
+                  <Button
+                    className="h-8"
+                    type="button"
+                    variant="destructive"
+                    onClick={() => {
+                      const didDelete = deleteCalculatedSlab();
+
+                      setUploadStatus(
+                        didDelete
+                          ? "Calculated slab deleted. DXF underlay remains loaded."
+                          : "No calculated slab layer to delete."
+                      );
+                    }}
+                  >
+                    Delete
+                  </Button>
+                </div>
+              </div>
+            ) : null}
             {boundaryLayerOptions.length ? (
               <div className="mb-3 space-y-2">
                 <Button
@@ -233,13 +364,31 @@ export function MeshZonesPanel() {
 
                     setUploadStatus(
                       didGenerate
-                        ? "Generated WORKING-SLAB from active layers."
+                        ? "Generated WORKING-SLAB. Review it, then apply base mesh."
                         : "No usable geometry found in active layers."
                     );
                   }}
                 >
                   Generate Working Slab
                 </Button>
+                {hasActiveSlabBoundary && underlay.reviewOnly ? (
+                  <Button
+                    className="w-full"
+                    type="button"
+                    variant="secondary"
+                    onClick={() => {
+                      const didActivate = activateBaseMeshOnWorkingSlab();
+
+                      setUploadStatus(
+                        didActivate
+                          ? "Base mesh is now active on WORKING-SLAB."
+                          : "Generate WORKING-SLAB before applying base mesh."
+                      );
+                    }}
+                  >
+                    Apply Base Mesh to Working Slab
+                  </Button>
+                ) : null}
                 <Label>Set Concrete Boundary Layer</Label>
                 <Select
                   onValueChange={(layerName) => {

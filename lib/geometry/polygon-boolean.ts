@@ -7,6 +7,10 @@ import type {
 
 import type { Polygon } from "@/types/structure";
 
+function sameCoordinate(a: Pair, b: Pair, tolerance = 0.001) {
+  return Math.abs(a[0] - b[0]) <= tolerance && Math.abs(a[1] - b[1]) <= tolerance;
+}
+
 function closeRing(ring: Ring): Ring {
   const first = ring[0];
   const last = ring[ring.length - 1];
@@ -19,7 +23,20 @@ function closeRing(ring: Ring): Ring {
 }
 
 function toRing(polygon: Polygon): Ring {
-  return closeRing(polygon.map<Pair>((point) => [point.x, point.y]));
+  const ring = polygon
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y))
+    .map<Pair>((point) => [point.x, point.y])
+    .reduce<Ring>((points, point) => {
+      const previous = points.at(-1);
+
+      if (!previous || !sameCoordinate(previous, point)) {
+        points.push(point);
+      }
+
+      return points;
+    }, []);
+
+  return closeRing(ring);
 }
 
 function toMultiPolygon(polygon: Polygon): MultiPolygon {
@@ -48,12 +65,20 @@ export function polygonArea(polygon: Polygon) {
 }
 
 export function intersectPolygons(subject: Polygon, clip: Polygon): Polygon[] {
-  return fromMultiPolygon(
-    polygonClipping.intersection(
-      toMultiPolygon(subject),
-      toMultiPolygon(clip)
-    ) as MultiPolygon
-  );
+  if (subject.length < 3 || clip.length < 3) {
+    return [];
+  }
+
+  try {
+    return fromMultiPolygon(
+      polygonClipping.intersection(
+        toMultiPolygon(subject),
+        toMultiPolygon(clip)
+      ) as MultiPolygon
+    );
+  } catch {
+    return [];
+  }
 }
 
 export function subtractPolygons(subject: Polygon, holes: Polygon[]): Polygon[] {
@@ -61,12 +86,20 @@ export function subtractPolygons(subject: Polygon, holes: Polygon[]): Polygon[] 
     return [subject];
   }
 
-  return fromMultiPolygon(
-    polygonClipping.difference(
-      toMultiPolygon(subject),
-      ...holes.map(toMultiPolygon)
-    ) as MultiPolygon
-  );
+  if (subject.length < 3) {
+    return [];
+  }
+
+  try {
+    return fromMultiPolygon(
+      polygonClipping.difference(
+        toMultiPolygon(subject),
+        ...holes.filter((hole) => hole.length >= 3).map(toMultiPolygon)
+      ) as MultiPolygon
+    );
+  } catch {
+    return [subject];
+  }
 }
 
 export function largestPolygonFragment(polygons: Polygon[]) {
