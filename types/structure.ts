@@ -83,6 +83,27 @@ export type SlabOpening = {
   wallThickness?: number;
 };
 
+export type SlabDesignAreaPurpose =
+  | "void"
+  | "no-mesh"
+  | "base-mesh"
+  | "extra-mesh"
+  | "analysis-zone"
+  | "custom";
+
+export type SlabDesignAreaSource = "user" | "dxf" | "fea";
+
+export type SlabDesignArea = {
+  id: string;
+  label: string;
+  polygon: Polygon;
+  purpose: SlabDesignAreaPurpose;
+  priority: number;
+  visible: boolean;
+  source: SlabDesignAreaSource;
+  meshZoneId?: string;
+};
+
 export type StructuralElementType = "perimeter_wall" | "core_wall" | "column";
 
 export type StructuralElement = {
@@ -98,6 +119,7 @@ export type SlabGeometry = {
   meshBoundary?: Polygon;
   meshInteriorBoundary?: Polygon;
   dwgUnderlay?: DwgUnderlay;
+  designAreas?: SlabDesignArea[];
   openings: SlabOpening[];
   structuralElements: StructuralElement[];
   concreteCover: number;

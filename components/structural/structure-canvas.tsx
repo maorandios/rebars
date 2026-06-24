@@ -18,6 +18,7 @@ import type {
   MeshZone,
   Point,
   Polygon,
+  SlabDesignArea,
   SlabGeometry,
   SlabOpening,
   StructuralElement
@@ -41,6 +42,7 @@ const cadTextHeight = {
 const cadMarkerSize = 220;
 const cadArrowSize = 180;
 const minimumDrawnZoneSize = 500;
+const minimumDesignAreaSize = 100;
 const cadCanvasBackground = "#121214";
 const meshBlue = "#0ea5e9";
 const meshActiveBlue = "#38bdf8";
@@ -315,6 +317,54 @@ function drawOpening(
   });
 }
 
+function drawDesignArea(
+  context: CanvasRenderingContext2D,
+  area: SlabDesignArea,
+  scale: number
+) {
+  if (!area.visible) {
+    return;
+  }
+
+  const color =
+    area.purpose === "no-mesh" || area.purpose === "void"
+      ? "#fbbf24"
+      : area.purpose === "extra-mesh"
+        ? "#a78bfa"
+        : "#34d399";
+  const center = polygonCenter(area.polygon);
+
+  drawPolygonPath(context, area.polygon);
+  context.fillStyle = color;
+  context.globalAlpha = 0.16;
+  context.fill();
+  context.globalAlpha = 1;
+
+  drawPolygonPath(context, area.polygon);
+  setDraftStroke(context, scale, {
+    color,
+    dash: [10, 6],
+    widthPx: 1.6
+  });
+  context.stroke();
+  resetDraftStroke(context);
+
+  drawText(context, area.label, center.x, center.y, scale, {
+    color,
+    height: cadTextHeight.small
+  });
+}
+
+function drawDesignAreas(
+  context: CanvasRenderingContext2D,
+  slabGeometry: SlabGeometry,
+  scale: number
+) {
+  for (const area of slabGeometry.designAreas ?? []) {
+    drawDesignArea(context, area, scale);
+  }
+}
+
 function drawDwgUnderlay(
   context: CanvasRenderingContext2D,
   slabGeometry: SlabGeometry,
@@ -531,15 +581,11 @@ function drawMeshSheets(
   context.save();
   clipToSlabBoundary(context, slabGeometry);
 
-  for (const [index, zone] of meshZones.entries()) {
-    const exclusionPolygons = meshZones
-      .slice(index + 1)
-      .map((nextZone) => nextZone.geometry);
+  for (const zone of meshZones) {
     const layout = generateBaseMeshLayout(
       slabGeometry,
       zone.parameters,
-      zone.geometry,
-      exclusionPolygons
+      zone.geometry
     );
     const isActive = zone.id === activeZoneId;
     const opacity = isActive ? 1 : 0.35;
@@ -835,6 +881,62 @@ function drawBoundaryTrace(
   }
 }
 
+function drawDesignAreaDraft(
+  context: CanvasRenderingContext2D,
+  points: Point[],
+  snapPoint: Point | null,
+  rectangleDraft: ZoneDraft | null,
+  scale: number
+) {
+  if (rectangleDraft) {
+    drawPolygonPath(context, rectangleFromPoints(rectangleDraft.start, rectangleDraft.current));
+    context.fillStyle = "rgba(251, 191, 36, 0.12)";
+    context.fill();
+    setDraftStroke(context, scale, {
+      color: "#fbbf24",
+      dash: [10, 6],
+      widthPx: 1.8
+    });
+    context.stroke();
+    resetDraftStroke(context);
+  }
+
+  if (points.length > 0) {
+    context.beginPath();
+    context.moveTo(points[0].x, points[0].y);
+
+    for (const point of points.slice(1)) {
+      context.lineTo(point.x, point.y);
+    }
+
+    if (snapPoint) {
+      context.lineTo(snapPoint.x, snapPoint.y);
+    }
+
+    setDraftStroke(context, scale, {
+      color: "#fbbf24",
+      dash: [12, 8],
+      widthPx: 2
+    });
+    context.stroke();
+    resetDraftStroke(context);
+  }
+
+  for (const point of points) {
+    context.beginPath();
+    context.arc(point.x, point.y, screenPx(5, scale), 0, Math.PI * 2);
+    context.fillStyle = "#fbbf24";
+    context.fill();
+  }
+
+  if (snapPoint) {
+    context.beginPath();
+    context.arc(snapPoint.x, snapPoint.y, screenPx(7, scale), 0, Math.PI * 2);
+    context.fillStyle = "#f59e0b";
+    context.fill();
+  }
+}
+
 function drawBoundaryEditHandles(
   context: CanvasRenderingContext2D,
   boundary: Polygon,
@@ -864,10 +966,36 @@ function drawBoundaryEditHandles(
   }
 }
 
+function drawDesignAreaEditHandles(
+  context: CanvasRenderingContext2D,
+  area: SlabDesignArea,
+  scale: number
+) {
+  drawPolylinePath(context, [...area.polygon, area.polygon[0]]);
+  setDraftStroke(context, scale, {
+    color: "#fbbf24",
+    dash: [8, 6],
+    widthPx: 1.8
+  });
+  context.stroke();
+  resetDraftStroke(context);
+
+  for (const point of area.polygon) {
+    context.beginPath();
+    context.arc(point.x, point.y, screenPx(7, scale), 0, Math.PI * 2);
+    context.fillStyle = "#fbbf24";
+    context.fill();
+    context.strokeStyle = "#020617";
+    context.lineWidth = screenPx(2, scale);
+    context.stroke();
+  }
+}
+
 export function StructureCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const zoneDraftRef = useRef<ZoneDraft | null>(null);
+  const designAreaRectangleDraftRef = useRef<ZoneDraft | null>(null);
   const editingVertexIndexRef = useRef<number | null>(null);
   const hasFitViewRef = useRef(false);
   const panRef = useRef({ x: canvasPadding, y: canvasPadding });
@@ -890,12 +1018,20 @@ export function StructureCanvas() {
     isDrawingZone,
     isDrawingBoundary,
     isEditingBoundary,
+    editingDesignAreaId,
+    isDrawingDesignArea,
+    designAreaDrawingMode,
     boundaryDraftPoints,
+    designAreaDraftPoints,
     addBoundaryTracePoint,
+    addDesignAreaDraftPoint,
     cancelDrawingZone,
+    commitDesignAreaPolygon,
     commitDrawnMeshZone,
     finishBoundaryTrace,
+    finishDesignAreaDraft,
     updateCalculatedBoundaryPoint,
+    updateDesignAreaPoint,
     updateActiveMeshZoneParameters
   } = useReinforcement();
   const layoutComparison = useMemo(
@@ -960,6 +1096,13 @@ export function StructureCanvas() {
           snapPoint,
           scaleRef.current
         );
+        drawDesignAreaDraft(
+          context,
+          designAreaDraftPoints,
+          snapPoint,
+          designAreaRectangleDraftRef.current,
+          scaleRef.current
+        );
         drawZoneDraft(context, zoneDraftRef.current, scaleRef.current);
         return;
       }
@@ -981,6 +1124,14 @@ export function StructureCanvas() {
           scaleRef.current
         );
       }
+      drawDesignAreas(context, slabGeometry, scaleRef.current);
+      const editingDesignArea = (slabGeometry.designAreas ?? []).find(
+        (area) => area.id === editingDesignAreaId
+      );
+
+      if (editingDesignArea) {
+        drawDesignAreaEditHandles(context, editingDesignArea, scaleRef.current);
+      }
       drawGridOriginMarker(
         context,
         slabGeometry,
@@ -995,12 +1146,21 @@ export function StructureCanvas() {
       );
     }
     drawBoundaryTrace(context, boundaryDraftPoints, snapPoint, scaleRef.current);
+    drawDesignAreaDraft(
+      context,
+      designAreaDraftPoints,
+      snapPoint,
+      designAreaRectangleDraftRef.current,
+      scaleRef.current
+    );
     drawZoneDraft(context, zoneDraftRef.current, scaleRef.current);
   }, [
     activeMeshZone.parameters,
     activeZoneId,
     boundaryDraftPoints,
+    editingDesignAreaId,
     isEditingBoundary,
+    designAreaDraftPoints,
     meshZones,
     slabGeometry,
     snapPoint
@@ -1126,6 +1286,30 @@ export function StructureCanvas() {
       return closestDistance <= hitRadius ? closestIndex : null;
     };
 
+    const designAreaVertexAt = (worldPoint: Point) => {
+      if (!editingDesignAreaId) {
+        return null;
+      }
+
+      const area = (slabGeometry.designAreas ?? []).find(
+        (designArea) => designArea.id === editingDesignAreaId
+      );
+      const hitRadius = screenPx(12, scaleRef.current);
+      let closestIndex: number | null = null;
+      let closestDistance = Number.POSITIVE_INFINITY;
+
+      for (const [index, vertex] of area?.polygon.entries() ?? []) {
+        const nextDistance = distance(worldPoint, vertex);
+
+        if (nextDistance < closestDistance) {
+          closestIndex = index;
+          closestDistance = nextDistance;
+        }
+      }
+
+      return closestDistance <= hitRadius ? closestIndex : null;
+    };
+
     const handleWheel = (event: WheelEvent) => {
       event.preventDefault();
 
@@ -1195,12 +1379,80 @@ export function StructureCanvas() {
         return;
       }
 
+      if (isDrawingDesignArea) {
+        if (event.button !== 0) {
+          return;
+        }
+
+        if (designAreaDrawingMode === "rectangle") {
+          try {
+            container.setPointerCapture(event.pointerId);
+          } catch {
+            // Synthetic/test pointer events may not have an active pointer capture.
+          }
+
+          const worldPoint = eventToWorldPoint(event);
+
+          designAreaRectangleDraftRef.current = {
+            current: worldPoint,
+            isDragging: true,
+            start: worldPoint
+          };
+          renderCanvas();
+          return;
+        }
+
+        const snappedPoint = snapToDxfVertex(eventToWorldPoint(event));
+
+        if (!snappedPoint) {
+          return;
+        }
+
+        const firstPoint = designAreaDraftPoints[0];
+
+        if (
+          firstPoint &&
+          designAreaDraftPoints.length >= 3 &&
+          distance(firstPoint, snappedPoint) <= screenPx(15, scaleRef.current)
+        ) {
+          finishDesignAreaDraft();
+          setSnapPoint(null);
+        } else {
+          addDesignAreaDraftPoint(snappedPoint);
+          setSnapPoint(snappedPoint);
+        }
+
+        renderCanvas();
+        return;
+      }
+
       if (isEditingBoundary) {
         if (event.button !== 0) {
           return;
         }
 
         const vertexIndex = boundaryVertexAt(eventToWorldPoint(event));
+
+        if (vertexIndex === null) {
+          return;
+        }
+
+        try {
+          container.setPointerCapture(event.pointerId);
+        } catch {
+          // Synthetic/test pointer events may not have an active pointer capture.
+        }
+
+        editingVertexIndexRef.current = vertexIndex;
+        return;
+      }
+
+      if (editingDesignAreaId) {
+        if (event.button !== 0) {
+          return;
+        }
+
+        const vertexIndex = designAreaVertexAt(eventToWorldPoint(event));
 
         if (vertexIndex === null) {
           return;
@@ -1249,11 +1501,28 @@ export function StructureCanvas() {
     };
 
     const handlePointerMove = (event: PointerEvent) => {
+      if (isDrawingDesignArea && designAreaRectangleDraftRef.current?.isDragging) {
+        designAreaRectangleDraftRef.current = {
+          ...designAreaRectangleDraftRef.current,
+          current: eventToWorldPoint(event)
+        };
+        renderCanvas();
+        return;
+      }
+
       if (editingVertexIndexRef.current !== null) {
         const worldPoint = eventToWorldPoint(event);
         const nextPoint = snapToDxfVertex(worldPoint) ?? worldPoint;
 
-        updateCalculatedBoundaryPoint(editingVertexIndexRef.current, nextPoint);
+        if (editingDesignAreaId) {
+          updateDesignAreaPoint(
+            editingDesignAreaId,
+            editingVertexIndexRef.current,
+            nextPoint
+          );
+        } else {
+          updateCalculatedBoundaryPoint(editingVertexIndexRef.current, nextPoint);
+        }
         renderCanvas();
         return;
       }
@@ -1276,13 +1545,33 @@ export function StructureCanvas() {
         return;
       }
 
-      if (isDrawingBoundary) {
+      if (isDrawingBoundary || isDrawingDesignArea) {
         setSnapPoint(snapToDxfVertex(eventToWorldPoint(event)));
         renderCanvas();
       }
     };
 
     const handlePointerUp = (event: PointerEvent) => {
+      if (isDrawingDesignArea && designAreaRectangleDraftRef.current?.isDragging) {
+        const draft = designAreaRectangleDraftRef.current;
+        const width = Math.abs(draft.current.x - draft.start.x);
+        const height = Math.abs(draft.current.y - draft.start.y);
+
+        designAreaRectangleDraftRef.current = null;
+
+        if (width >= minimumDesignAreaSize && height >= minimumDesignAreaSize) {
+          commitDesignAreaPolygon(rectangleFromPoints(draft.start, draft.current));
+        }
+
+        renderCanvas();
+        try {
+          container.releasePointerCapture(event.pointerId);
+        } catch {
+          // Pointer capture may not exist for synthetic/test events.
+        }
+        return;
+      }
+
       if (editingVertexIndexRef.current !== null) {
         editingVertexIndexRef.current = null;
 
@@ -1350,18 +1639,27 @@ export function StructureCanvas() {
     };
   }, [
     addBoundaryTracePoint,
+    addDesignAreaDraftPoint,
     boundaryDraftPoints,
     cancelDrawingZone,
+    commitDesignAreaPolygon,
     commitDrawnMeshZone,
+    editingDesignAreaId,
     finishBoundaryTrace,
+    finishDesignAreaDraft,
     isDrawingBoundary,
+    isDrawingDesignArea,
     isEditingBoundary,
     isDrawingZone,
     meshZones,
+    designAreaDraftPoints,
+    designAreaDrawingMode,
     slabGeometry.boundary,
+    slabGeometry.designAreas,
     slabGeometry.dwgUnderlay?.dxfVertices,
     renderCanvas,
-    updateCalculatedBoundaryPoint
+    updateCalculatedBoundaryPoint,
+    updateDesignAreaPoint
   ]);
 
   return (
@@ -1425,6 +1723,8 @@ export function StructureCanvas() {
         ref={containerRef}
         className={`h-full w-full touch-none ${
           isDrawingZone || isDrawingBoundary || isEditingBoundary
+          || editingDesignAreaId
+          || isDrawingDesignArea
             ? "cursor-crosshair"
             : "cursor-default"
         }`}
@@ -1457,6 +1757,18 @@ export function StructureCanvas() {
       {isEditingBoundary ? (
         <div className="pointer-events-none absolute left-1/2 top-20 z-10 max-w-md -translate-x-1/2 rounded-md border border-primary/30 bg-background/90 px-4 py-2 text-sm font-medium text-primary shadow-sm backdrop-blur">
           Drag blue boundary points to adjust the calculated slab
+        </div>
+      ) : null}
+      {editingDesignAreaId ? (
+        <div className="pointer-events-none absolute left-1/2 top-20 z-10 max-w-md -translate-x-1/2 rounded-md border border-amber-400/30 bg-background/90 px-4 py-2 text-sm font-medium text-amber-300 shadow-sm backdrop-blur">
+          Drag amber area points to edit the design area
+        </div>
+      ) : null}
+      {isDrawingDesignArea ? (
+        <div className="pointer-events-none absolute left-1/2 top-20 z-10 max-w-md -translate-x-1/2 rounded-md border border-amber-400/30 bg-background/90 px-4 py-2 text-sm font-medium text-amber-300 shadow-sm backdrop-blur">
+          {designAreaDrawingMode === "rectangle"
+            ? "Drag a rectangular design area. Default purpose: no mesh."
+            : "Click DXF vertices to trace a design area, then finish."}
         </div>
       ) : null}
     </div>

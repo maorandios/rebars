@@ -22,18 +22,27 @@ import type {
   MeshZone,
   MeshZoneUpdate,
   Point,
+  SlabDesignArea,
+  SlabDesignAreaPurpose,
   SlabGeometry
 } from "@/types/structure";
+
+type DesignAreaDrawingMode = "polygon" | "rectangle";
 
 type ReinforcementContextValue = {
   slabGeometry: SlabGeometry;
   meshZones: MeshZone[];
   activeZoneId: string;
   activeMeshZone: MeshZone;
+  selectedDesignAreaId: string | null;
   isDrawingZone: boolean;
   isDrawingBoundary: boolean;
   isEditingBoundary: boolean;
+  editingDesignAreaId: string | null;
+  isDrawingDesignArea: boolean;
+  designAreaDrawingMode: DesignAreaDrawingMode | null;
   boundaryDraftPoints: Point[];
+  designAreaDraftPoints: Point[];
   beginDrawingZone: () => void;
   cancelDrawingZone: () => void;
   commitDrawnMeshZone: (geometry: MeshZone["geometry"]) => void;
@@ -46,6 +55,26 @@ type ReinforcementContextValue = {
   updateCalculatedBoundaryPoint: (index: number, point: Point) => void;
   setCalculatedSlabVisible: (visible: boolean) => void;
   deleteCalculatedSlab: () => boolean;
+  deleteDxfUnderlay: () => void;
+  setSelectedDesignAreaId: (areaId: string | null) => void;
+  setDesignAreaVisible: (areaId: string, visible: boolean) => void;
+  updateDesignAreaPurpose: (
+    areaId: string,
+    purpose: SlabDesignAreaPurpose
+  ) => void;
+  deleteDesignArea: (areaId: string) => void;
+  beginDesignAreaEdit: (areaId: string) => void;
+  finishDesignAreaEdit: () => void;
+  updateDesignAreaPoint: (areaId: string, index: number, point: Point) => void;
+  createMeshZoneForDesignArea: (areaId: string) => boolean;
+  beginDesignAreaDraw: (mode: DesignAreaDrawingMode) => void;
+  cancelDesignAreaDraw: () => void;
+  addDesignAreaDraftPoint: (point: Point) => void;
+  finishDesignAreaDraft: () => boolean;
+  commitDesignAreaPolygon: (
+    polygon: Point[],
+    purpose?: SlabDesignAreaPurpose
+  ) => boolean;
   importSlabGeometry: (slabGeometry: SlabGeometry) => void;
   generateSlabFromVisibleLayers: () => boolean;
   activateBaseMeshOnWorkingSlab: () => boolean;
@@ -128,6 +157,25 @@ function createMainZoneForSlab(
   });
 }
 
+function createMeshZoneForArea(
+  slabGeometry: SlabGeometry,
+  area: SlabDesignArea,
+  index: number,
+  baseParameters: BaseMeshSettings
+): MeshZone {
+  return withRecommendedZoneOrientation(slabGeometry, {
+    id: `ZONE-AREA-${String(index + 1).padStart(2, "0")}`,
+    name: `Mesh - ${area.label}`,
+    isMainZone: false,
+    geometry: area.polygon,
+    parameters: {
+      ...baseParameters,
+      gridOffsetX: 0,
+      gridOffsetY: 0
+    }
+  });
+}
+
 const calculatedSlabLayer = "CALCULATED-SLAB";
 
 function calculatedSlabLine(boundary: Point[]) {
@@ -169,10 +217,20 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     )
   );
   const [activeZoneId, setActiveZoneId] = useState(() => cloneMeshZones()[0].id);
+  const [selectedDesignAreaId, setSelectedDesignAreaId] = useState<string | null>(
+    null
+  );
   const [isDrawingZone, setIsDrawingZone] = useState(false);
   const [isDrawingBoundary, setIsDrawingBoundary] = useState(false);
   const [isEditingBoundary, setIsEditingBoundary] = useState(false);
+  const [editingDesignAreaId, setEditingDesignAreaId] = useState<string | null>(
+    null
+  );
+  const [isDrawingDesignArea, setIsDrawingDesignArea] = useState(false);
+  const [designAreaDrawingMode, setDesignAreaDrawingMode] =
+    useState<DesignAreaDrawingMode | null>(null);
   const [boundaryDraftPoints, setBoundaryDraftPoints] = useState<Point[]>([]);
+  const [designAreaDraftPoints, setDesignAreaDraftPoints] = useState<Point[]>([]);
   const activeMeshZone =
     meshZones.find((zone) => zone.id === activeZoneId) ?? meshZones[0];
 
@@ -213,6 +271,9 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
 
   const beginDrawingZone = useCallback(() => {
     setIsDrawingZone(true);
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDraftPoints([]);
   }, []);
 
   const cancelDrawingZone = useCallback(() => {
@@ -240,6 +301,9 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
   const beginBoundaryTrace = useCallback(() => {
     setBoundaryDraftPoints([]);
     setIsDrawingBoundary(true);
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDraftPoints([]);
     setIsDrawingZone(false);
   }, []);
 
@@ -250,6 +314,26 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
 
   const addBoundaryTracePoint = useCallback((point: Point) => {
     setBoundaryDraftPoints((current) => [...current, point]);
+  }, []);
+
+  const beginDesignAreaDraw = useCallback((mode: DesignAreaDrawingMode) => {
+    setDesignAreaDraftPoints([]);
+    setDesignAreaDrawingMode(mode);
+    setIsDrawingDesignArea(true);
+    setIsDrawingBoundary(false);
+    setIsEditingBoundary(false);
+    setIsDrawingZone(false);
+    setBoundaryDraftPoints([]);
+  }, []);
+
+  const cancelDesignAreaDraw = useCallback(() => {
+    setDesignAreaDraftPoints([]);
+    setDesignAreaDrawingMode(null);
+    setIsDrawingDesignArea(false);
+  }, []);
+
+  const addDesignAreaDraftPoint = useCallback((point: Point) => {
+    setDesignAreaDraftPoints((current) => [...current, point]);
   }, []);
 
   const finishBoundaryTrace = useCallback(() => {
@@ -282,6 +366,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       hasActiveSlabBoundary: true,
       meshBoundary: undefined,
       meshInteriorBoundary: undefined,
+      designAreas: [],
       openings: [],
       structuralElements: []
     };
@@ -293,12 +378,61 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setSlabGeometry(nextSlabGeometry);
     setMeshZones([nextMainZone]);
     setActiveZoneId(nextMainZone.id);
+    setSelectedDesignAreaId(null);
+    setEditingDesignAreaId(null);
     setBoundaryDraftPoints([]);
     setIsDrawingBoundary(false);
     setIsEditingBoundary(false);
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDraftPoints([]);
     setIsDrawingZone(false);
     return true;
   }, [activeMeshZone.parameters, boundaryDraftPoints, slabGeometry]);
+
+  const commitDesignAreaPolygon = useCallback(
+    (polygon: Point[], purpose: SlabDesignAreaPurpose = "no-mesh") => {
+      if (!slabGeometry.hasActiveSlabBoundary || polygon.length < 3) {
+        return false;
+      }
+
+      const designAreas = slabGeometry.designAreas ?? [];
+      const areaIndex = designAreas.length + 1;
+      const nextSlabGeometry: SlabGeometry = {
+        ...slabGeometry,
+        designAreas: [
+          ...designAreas,
+          {
+            id: `AREA-${String(areaIndex).padStart(2, "0")}`,
+            label: `Area ${areaIndex}`,
+            meshZoneId: activeZoneId,
+            polygon,
+            priority: areaIndex,
+            purpose,
+            source: "user",
+            visible: true
+          }
+        ]
+      };
+      const nextMainZone = createMainZoneForSlab(
+        nextSlabGeometry,
+        activeMeshZone.parameters
+      );
+
+      setSlabGeometry(nextSlabGeometry);
+      setMeshZones([nextMainZone]);
+      setActiveZoneId(nextMainZone.id);
+      setDesignAreaDraftPoints([]);
+      setDesignAreaDrawingMode(null);
+      setIsDrawingDesignArea(false);
+      return true;
+    },
+    [activeMeshZone.parameters, activeZoneId, slabGeometry]
+  );
+
+  const finishDesignAreaDraft = useCallback(() => {
+    return commitDesignAreaPolygon(designAreaDraftPoints);
+  }, [commitDesignAreaPolygon, designAreaDraftPoints]);
 
   const beginBoundaryEdit = useCallback(() => {
     if (!slabGeometry.hasActiveSlabBoundary) {
@@ -307,6 +441,9 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
 
     setIsEditingBoundary(true);
     setIsDrawingBoundary(false);
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDraftPoints([]);
     setIsDrawingZone(false);
     setBoundaryDraftPoints([]);
   }, [slabGeometry.hasActiveSlabBoundary]);
@@ -314,6 +451,141 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
   const finishBoundaryEdit = useCallback(() => {
     setIsEditingBoundary(false);
   }, []);
+
+  const setDesignAreaVisible = useCallback((areaId: string, visible: boolean) => {
+    setSlabGeometry((current) => ({
+      ...current,
+      designAreas: (current.designAreas ?? []).map((area) =>
+        area.id === areaId ? { ...area, visible } : area
+      )
+    }));
+  }, []);
+
+  const updateDesignAreaPurpose = useCallback(
+    (areaId: string, purpose: SlabDesignAreaPurpose) => {
+      setSlabGeometry((current) => ({
+        ...current,
+        designAreas: (current.designAreas ?? []).map((area) =>
+          area.id === areaId ? { ...area, purpose } : area
+        )
+      }));
+    },
+    []
+  );
+
+  const deleteDesignArea = useCallback(
+    (areaId: string) => {
+      const linkedMeshZoneId = (slabGeometry.designAreas ?? []).find(
+        (area) => area.id === areaId
+      )?.meshZoneId;
+
+      setSlabGeometry((current) => ({
+        ...current,
+        designAreas: (current.designAreas ?? []).filter(
+          (area) => area.id !== areaId
+        )
+      }));
+      if (linkedMeshZoneId) {
+        setMeshZones((current) =>
+          current.filter((zone) => zone.id !== linkedMeshZoneId)
+        );
+        setActiveZoneId((current) =>
+          current === linkedMeshZoneId ? "ZONE-MAIN" : current
+        );
+      }
+      setSelectedDesignAreaId((current) => (current === areaId ? null : current));
+      setEditingDesignAreaId((current) => (current === areaId ? null : current));
+    },
+    [slabGeometry.designAreas]
+  );
+
+  const beginDesignAreaEdit = useCallback((areaId: string) => {
+    setSelectedDesignAreaId(areaId);
+    setEditingDesignAreaId(areaId);
+    setIsEditingBoundary(false);
+    setIsDrawingBoundary(false);
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDraftPoints([]);
+    setIsDrawingZone(false);
+  }, []);
+
+  const finishDesignAreaEdit = useCallback(() => {
+    setEditingDesignAreaId(null);
+  }, []);
+
+  const updateDesignAreaPoint = useCallback(
+    (areaId: string, index: number, point: Point) => {
+      setSlabGeometry((current) => {
+        const nextSlabGeometry = {
+          ...current,
+          designAreas: (current.designAreas ?? []).map((area) =>
+            area.id === areaId
+              ? {
+                  ...area,
+                  polygon: area.polygon.map((areaPoint, pointIndex) =>
+                    pointIndex === index ? point : areaPoint
+                  )
+                }
+              : area
+          )
+        };
+
+        setMeshZones((zones) =>
+          zones.map((zone) => {
+            const area = nextSlabGeometry.designAreas?.find(
+              (designArea) => designArea.meshZoneId === zone.id
+            );
+
+            return area ? { ...zone, geometry: area.polygon } : zone;
+          })
+        );
+
+        return nextSlabGeometry;
+      });
+    },
+    []
+  );
+
+  const createMeshZoneForDesignArea = useCallback(
+    (areaId: string) => {
+      const area = (slabGeometry.designAreas ?? []).find(
+        (designArea) => designArea.id === areaId
+      );
+
+      if (!area) {
+        return false;
+      }
+
+      const nextZone = createMeshZoneForArea(
+        slabGeometry,
+        area,
+        meshZones.length,
+        activeMeshZone.parameters
+      );
+
+      setMeshZones((current) => [...current, nextZone]);
+      setSlabGeometry((current) => ({
+        ...current,
+        designAreas: (current.designAreas ?? []).map((designArea) =>
+          designArea.id === areaId
+            ? {
+                ...designArea,
+                meshZoneId: nextZone.id,
+                purpose:
+                  designArea.purpose === "no-mesh"
+                    ? "extra-mesh"
+                    : designArea.purpose
+              }
+            : designArea
+        )
+      }));
+      setActiveZoneId(nextZone.id);
+      setSelectedDesignAreaId(areaId);
+      return true;
+    },
+    [activeMeshZone.parameters, meshZones.length, slabGeometry]
+  );
 
   const updateCalculatedBoundaryPoint = useCallback(
     (index: number, point: Point) => {
@@ -394,6 +666,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       hasActiveSlabBoundary: false,
       meshBoundary: undefined,
       meshInteriorBoundary: undefined,
+      designAreas: [],
       openings: [],
       structuralElements: []
     };
@@ -406,11 +679,36 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setMeshZones([nextMainZone]);
     setActiveZoneId(nextMainZone.id);
     setBoundaryDraftPoints([]);
+    setSelectedDesignAreaId(null);
+    setEditingDesignAreaId(null);
     setIsDrawingBoundary(false);
     setIsEditingBoundary(false);
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDraftPoints([]);
     setIsDrawingZone(false);
     return true;
   }, [activeMeshZone.parameters, slabGeometry]);
+
+  const deleteDxfUnderlay = useCallback(() => {
+    const nextSlabGeometry = cloneSlabGeometry();
+    const nextZones = cloneMeshZones().map((zone) =>
+      withRecommendedZoneOrientation(nextSlabGeometry, zone)
+    );
+
+    setSlabGeometry(nextSlabGeometry);
+    setMeshZones(nextZones);
+    setActiveZoneId(nextZones[0].id);
+    setSelectedDesignAreaId(null);
+    setEditingDesignAreaId(null);
+    setIsDrawingZone(false);
+    setIsDrawingBoundary(false);
+    setIsEditingBoundary(false);
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDraftPoints([]);
+    setBoundaryDraftPoints([]);
+  }, []);
 
   const importSlabGeometry = useCallback(
     (nextSlabGeometry: SlabGeometry) => {
@@ -423,9 +721,14 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       setSlabGeometry(nextSlabGeometry);
       setMeshZones([nextMainZone]);
       setActiveZoneId(nextMainZone.id);
+      setSelectedDesignAreaId(null);
+      setEditingDesignAreaId(null);
       setIsDrawingZone(false);
       setIsDrawingBoundary(false);
       setIsEditingBoundary(false);
+      setIsDrawingDesignArea(false);
+      setDesignAreaDrawingMode(null);
+      setDesignAreaDraftPoints([]);
       setBoundaryDraftPoints([]);
     },
     [activeMeshZone.parameters]
@@ -450,9 +753,14 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       setSlabGeometry(nextSlabGeometry);
       setMeshZones([nextMainZone]);
       setActiveZoneId(nextMainZone.id);
+      setSelectedDesignAreaId(null);
+      setEditingDesignAreaId(null);
       setIsDrawingZone(false);
       setIsDrawingBoundary(false);
       setIsEditingBoundary(false);
+      setIsDrawingDesignArea(false);
+      setDesignAreaDrawingMode(null);
+      setDesignAreaDraftPoints([]);
       setBoundaryDraftPoints([]);
       return true;
     },
@@ -476,9 +784,14 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setSlabGeometry(nextSlabGeometry);
     setMeshZones([nextMainZone]);
     setActiveZoneId(nextMainZone.id);
+    setSelectedDesignAreaId(null);
+    setEditingDesignAreaId(null);
     setIsDrawingZone(false);
     setIsDrawingBoundary(false);
     setIsEditingBoundary(false);
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDraftPoints([]);
     setBoundaryDraftPoints([]);
     return true;
   }, [activeMeshZone.parameters, slabGeometry]);
@@ -503,9 +816,14 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setSlabGeometry(nextSlabGeometry);
     setMeshZones([nextMainZone]);
     setActiveZoneId(nextMainZone.id);
+    setSelectedDesignAreaId(null);
+    setEditingDesignAreaId(null);
     setIsDrawingZone(false);
     setIsDrawingBoundary(false);
     setIsEditingBoundary(false);
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDraftPoints([]);
     setBoundaryDraftPoints([]);
     return true;
   }, [activeMeshZone.parameters, slabGeometry]);
@@ -540,9 +858,14 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setSlabGeometry(nextSlabGeometry);
     setMeshZones(nextZones);
     setActiveZoneId(nextZones[0].id);
+    setSelectedDesignAreaId(null);
+    setEditingDesignAreaId(null);
     setIsDrawingZone(false);
     setIsDrawingBoundary(false);
     setIsEditingBoundary(false);
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDraftPoints([]);
     setBoundaryDraftPoints([]);
   }, []);
 
@@ -563,10 +886,15 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       meshZones,
       activeZoneId,
       activeMeshZone,
+      selectedDesignAreaId,
       isDrawingZone,
       isDrawingBoundary,
       isEditingBoundary,
+      editingDesignAreaId,
+      isDrawingDesignArea,
+      designAreaDrawingMode,
       boundaryDraftPoints,
+      designAreaDraftPoints,
       beginDrawingZone,
       cancelDrawingZone,
       commitDrawnMeshZone,
@@ -579,6 +907,20 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       updateCalculatedBoundaryPoint,
       setCalculatedSlabVisible,
       deleteCalculatedSlab,
+      deleteDxfUnderlay,
+      setSelectedDesignAreaId,
+      setDesignAreaVisible,
+      updateDesignAreaPurpose,
+      deleteDesignArea,
+      beginDesignAreaEdit,
+      finishDesignAreaEdit,
+      updateDesignAreaPoint,
+      createMeshZoneForDesignArea,
+      beginDesignAreaDraw,
+      cancelDesignAreaDraw,
+      addDesignAreaDraftPoint,
+      finishDesignAreaDraft,
+      commitDesignAreaPolygon,
       activateBaseMeshOnWorkingSlab,
       generateSlabFromVisibleLayers,
       importSlabGeometry,
@@ -595,10 +937,15 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       meshZones,
       activeZoneId,
       activeMeshZone,
+      selectedDesignAreaId,
       isDrawingZone,
       isDrawingBoundary,
       isEditingBoundary,
+      editingDesignAreaId,
+      isDrawingDesignArea,
+      designAreaDrawingMode,
       boundaryDraftPoints,
+      designAreaDraftPoints,
       beginDrawingZone,
       cancelDrawingZone,
       commitDrawnMeshZone,
@@ -611,6 +958,20 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       updateCalculatedBoundaryPoint,
       setCalculatedSlabVisible,
       deleteCalculatedSlab,
+      deleteDxfUnderlay,
+      setSelectedDesignAreaId,
+      setDesignAreaVisible,
+      updateDesignAreaPurpose,
+      deleteDesignArea,
+      beginDesignAreaEdit,
+      finishDesignAreaEdit,
+      updateDesignAreaPoint,
+      createMeshZoneForDesignArea,
+      beginDesignAreaDraw,
+      cancelDesignAreaDraw,
+      addDesignAreaDraftPoint,
+      finishDesignAreaDraft,
+      commitDesignAreaPolygon,
       activateBaseMeshOnWorkingSlab,
       generateSlabFromVisibleLayers,
       importSlabGeometry,

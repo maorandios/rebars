@@ -24,7 +24,7 @@ import { useReinforcement } from "@/context/reinforcement-context";
 import { mockBaseMeshSettings } from "@/data/mockStructureData";
 import { parseDxfToSlabGeometry } from "@/lib/dxf-parser";
 import { compareBaseMeshOrientations } from "@/lib/geometry/mesh-sheet-layout";
-import type { BaseMeshSettings } from "@/types/structure";
+import type { BaseMeshSettings, SlabDesignAreaPurpose } from "@/types/structure";
 
 const diameterOptions: BaseMeshSettings["diameter"][] = [8, 10, 12];
 const spacingOptions: BaseMeshSettings["spacing"][] = [150, 200, 250];
@@ -33,6 +33,14 @@ const originOptions: BaseMeshSettings["originCorner"][] = [
   "bottom-right",
   "top-left",
   "top-right"
+];
+const areaPurposeOptions: SlabDesignAreaPurpose[] = [
+  "no-mesh",
+  "extra-mesh",
+  "base-mesh",
+  "void",
+  "analysis-zone",
+  "custom"
 ];
 
 type NumericDraftValues = {
@@ -73,24 +81,40 @@ export function MeshZonesPanel() {
     slabGeometry,
     meshZones,
     activeZoneId,
+    selectedDesignAreaId,
     isDrawingZone,
     isDrawingBoundary,
     isEditingBoundary,
+    editingDesignAreaId,
+    isDrawingDesignArea,
+    designAreaDrawingMode,
     boundaryDraftPoints,
+    designAreaDraftPoints,
     activateBaseMeshOnWorkingSlab,
     beginBoundaryEdit,
+    beginDesignAreaEdit,
     beginBoundaryTrace,
     beginDrawingZone,
+    beginDesignAreaDraw,
     cancelBoundaryTrace,
+    cancelDesignAreaDraw,
     deleteCalculatedSlab,
+    deleteDesignArea,
+    deleteDxfUnderlay,
     finishBoundaryEdit,
+    finishDesignAreaEdit,
     finishBoundaryTrace,
+    finishDesignAreaDraft,
     generateSlabFromVisibleLayers,
     importSlabGeometry,
     selectSlabBoundaryLayer,
+    setSelectedDesignAreaId,
     setCalculatedSlabVisible,
+    setDesignAreaVisible,
     setUnderlayLayerVisible,
-    setActiveZoneId
+    setActiveZoneId,
+    updateDesignAreaPurpose,
+    createMeshZoneForDesignArea
   } = useReinforcement();
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const underlay = slabGeometry.dwgUnderlay;
@@ -98,6 +122,7 @@ export function MeshZonesPanel() {
   const calculatedSlabLayer = underlay?.layers?.find(
     (layer) => layer.name === "CALCULATED-SLAB"
   );
+  const designAreas = slabGeometry.designAreas ?? [];
   const boundaryLayerOptions = useMemo(() => {
     const counts = new Map<string, number>();
 
@@ -133,19 +158,19 @@ export function MeshZonesPanel() {
   }
 
   return (
-    <aside className="flex h-full w-64 shrink-0 flex-col border-r bg-card/50 backdrop-blur-sm">
+    <aside className="flex h-full w-72 shrink-0 flex-col border-r bg-card/50 backdrop-blur-sm">
       <div className="border-b p-4">
         <div className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-          Layers
+          Slab Workflow
         </div>
-        <h2 className="mt-1 text-lg font-semibold">Mesh Zones</h2>
+        <h2 className="mt-1 text-lg font-semibold">Define Geometry</h2>
       </div>
 
       <div className="flex-1 space-y-4 overflow-y-auto p-3">
         <div className="rounded-md border bg-background/40 p-3">
           <div className="mb-3 flex items-center gap-2">
             <Upload className="h-4 w-4 text-primary" />
-            <Label htmlFor="dxf-upload">File Upload</Label>
+            <Label htmlFor="dxf-upload">1. Import DXF Reference</Label>
           </div>
           <Input
             accept=".dxf"
@@ -157,8 +182,8 @@ export function MeshZonesPanel() {
             }}
           />
           <p className="mt-2 text-xs leading-5 text-muted-foreground">
-            Upload a DXF with a closed slab polyline. Structural layers like
-            S-SLAB and S-OPENING are detected automatically.
+            Load a Revit/DXF plan as a dim reference. Then trace the exact slab
+            and design areas on top of it.
           </p>
           {uploadStatus ? (
             <div className="mt-2 rounded-md border bg-muted/30 p-2 text-xs leading-5 text-muted-foreground">
@@ -167,64 +192,15 @@ export function MeshZonesPanel() {
           ) : null}
         </div>
 
-        <div className="rounded-md border bg-background/40 p-3">
-          <div className="mb-3 flex items-center justify-between gap-2">
-            <Label>Zone List</Label>
-            <Button
-              className="h-8 gap-1 px-2"
-              variant={isDrawingZone ? "secondary" : "default"}
-              onClick={beginDrawingZone}
-            >
-              <Plus className="h-3.5 w-3.5" />
-              {isDrawingZone ? "Drawing" : "Add"}
-            </Button>
-          </div>
-
-          {isDrawingZone ? (
-            <div className="mb-3 rounded-md border border-primary/30 bg-primary/10 p-2 text-xs leading-5 text-primary">
-              Click and drag on the canvas to define the new mesh area.
-            </div>
-          ) : null}
-
-          <div className="space-y-2">
-            {meshZones.map((zone) => (
-              <button
-                key={zone.id}
-                className={`w-full rounded-md border px-3 py-2 text-left text-sm transition ${
-                  zone.id === activeZoneId
-                    ? "border-primary bg-primary/10 text-primary"
-                    : "bg-card hover:bg-muted"
-                }`}
-                suppressHydrationWarning
-                type="button"
-                onClick={() => setActiveZoneId(zone.id)}
-              >
-                <span className="block font-medium" suppressHydrationWarning>
-                  {zone.name}
-                </span>
-                <span
-                  className="text-xs text-muted-foreground"
-                  suppressHydrationWarning
-                >
-                  {zone.isMainZone ? "Main base mesh" : zone.id}
-                </span>
-              </button>
-            ))}
-          </div>
-        </div>
-
         <div className="rounded-md border bg-background/40 p-3 text-xs leading-5 text-muted-foreground">
-          <div className="font-medium text-foreground">Layer Stack</div>
-          <div className="mt-2">DWG Underlay</div>
-          <div>Structural Concrete</div>
-          <div>Base Mesh Zones</div>
-          <div>Canvas Annotations</div>
+          <div className="font-medium text-foreground">Project Manager</div>
+          <div className="mt-2">Import DXF, define slab boundary, add design areas, then attach mesh layers to slab or areas.</div>
         </div>
 
         {underlay?.layers?.length ? (
           <div className="rounded-md border bg-background/40 p-3">
             <div className="mb-3">
-              <div className="font-medium text-foreground">Underlay Layers</div>
+              <div className="font-medium text-foreground">2. DXF Layers</div>
               {underlay.importedFileName ? (
                 <div className="mt-1 truncate text-xs text-muted-foreground">
                   {underlay.importedFileName}
@@ -249,7 +225,7 @@ export function MeshZonesPanel() {
                   );
                 }}
               >
-                הגדר גבול תקרה
+                3. הגדר גבול תקרה
               </Button>
               {isDrawingBoundary ? (
                 <div className="space-y-2 rounded-md border border-primary/30 bg-primary/10 p-2 text-xs leading-5 text-primary">
@@ -294,7 +270,7 @@ export function MeshZonesPanel() {
                 <div className="flex items-center justify-between gap-2">
                   <div>
                     <div className="font-medium text-foreground">
-                      CALCULATED-SLAB
+                      Active Slab Boundary
                     </div>
                     <div className="text-muted-foreground">
                       {slabGeometry.boundary.length} boundary points
@@ -351,6 +327,221 @@ export function MeshZonesPanel() {
                   >
                     Delete
                   </Button>
+                </div>
+                <div className="space-y-2 rounded-md border border-background/50 bg-background/30 p-2">
+                  <div className="font-medium text-foreground">
+                    4. Design Areas
+                  </div>
+                  <div className="text-muted-foreground">
+                    {(slabGeometry.designAreas ?? []).length} areas defined.
+                    Default purpose: no mesh.
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button
+                      className="h-8"
+                      type="button"
+                      variant={
+                        isDrawingDesignArea && designAreaDrawingMode === "polygon"
+                          ? "secondary"
+                          : "outline"
+                      }
+                      onClick={() => {
+                        beginDesignAreaDraw("polygon");
+                        setUploadStatus(
+                          "Design area vertex mode active. Click snapped vertices, then finish."
+                        );
+                      }}
+                    >
+                      Vertex Area
+                    </Button>
+                    <Button
+                      className="h-8"
+                      type="button"
+                      variant={
+                        isDrawingDesignArea &&
+                        designAreaDrawingMode === "rectangle"
+                          ? "secondary"
+                          : "outline"
+                      }
+                      onClick={() => {
+                        beginDesignAreaDraw("rectangle");
+                        setUploadStatus(
+                          "Rectangle design area mode active. Drag on the canvas."
+                        );
+                      }}
+                    >
+                      Rect Area
+                    </Button>
+                  </div>
+                  {isDrawingDesignArea ? (
+                    <div className="space-y-2 rounded-md border border-primary/30 bg-primary/10 p-2 text-primary">
+                      <div>
+                        {designAreaDrawingMode === "polygon"
+                          ? `Area points: ${designAreaDraftPoints.length}`
+                          : "Drag a rectangle on the canvas"}
+                      </div>
+                      <div className="flex gap-2">
+                        {designAreaDrawingMode === "polygon" ? (
+                          <Button
+                            className="h-8 flex-1"
+                            type="button"
+                            variant="secondary"
+                            onClick={() => {
+                              const didFinish = finishDesignAreaDraft();
+
+                              setUploadStatus(
+                                didFinish
+                                  ? "Design area created. Current purpose: no mesh."
+                                  : "Pick at least 3 area points before finishing."
+                              );
+                            }}
+                          >
+                            Finish Area
+                          </Button>
+                        ) : null}
+                        <Button
+                          className="h-8 flex-1"
+                          type="button"
+                          variant="outline"
+                          onClick={() => {
+                            cancelDesignAreaDraw();
+                            setUploadStatus("Design area drawing cancelled.");
+                          }}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
+                  <details className="rounded-md border bg-card/60 p-2" open>
+                    <summary className="cursor-pointer text-sm font-medium text-foreground">
+                      Design Area Tree
+                    </summary>
+                    <div className="mt-2 space-y-2">
+                      {designAreas.length === 0 ? (
+                        <div className="rounded-md border border-dashed p-2 text-xs text-muted-foreground">
+                          No areas yet. Draw a vertex or rectangle area after the
+                          slab boundary is defined.
+                        </div>
+                      ) : null}
+                      {designAreas.map((area) => {
+                        const linkedMeshZone = meshZones.find(
+                          (zone) => zone.id === area.meshZoneId
+                        );
+                        const isSelected = selectedDesignAreaId === area.id;
+                        const isEditing = editingDesignAreaId === area.id;
+
+                        return (
+                          <div
+                            key={area.id}
+                            className={`space-y-2 rounded-md border p-2 ${
+                              isSelected
+                                ? "border-amber-300 bg-amber-300/10"
+                                : "bg-background/50"
+                            }`}
+                          >
+                            <button
+                              className="w-full text-left"
+                              type="button"
+                              onClick={() => setSelectedDesignAreaId(area.id)}
+                            >
+                              <span className="block text-sm font-medium text-foreground">
+                                └ {area.label}
+                              </span>
+                              <span className="text-xs text-muted-foreground">
+                                {area.polygon.length} pts | {area.purpose}
+                              </span>
+                            </button>
+                            <div className="grid grid-cols-2 gap-2">
+                              <Button
+                                className="h-8"
+                                type="button"
+                                variant={area.visible ? "secondary" : "outline"}
+                                onClick={() =>
+                                  setDesignAreaVisible(area.id, !area.visible)
+                                }
+                              >
+                                {area.visible ? "Hide" : "Show"}
+                              </Button>
+                              <Button
+                                className="h-8"
+                                type="button"
+                                variant={isEditing ? "secondary" : "outline"}
+                                onClick={() => {
+                                  if (isEditing) {
+                                    finishDesignAreaEdit();
+                                    setUploadStatus("Area edit finished.");
+                                  } else {
+                                    beginDesignAreaEdit(area.id);
+                                    setUploadStatus(
+                                      "Drag amber area vertices on the canvas."
+                                    );
+                                  }
+                                }}
+                              >
+                                {isEditing ? "Done" : "Edit"}
+                              </Button>
+                            </div>
+                            <Select
+                              value={area.purpose}
+                              onValueChange={(value: SlabDesignAreaPurpose) =>
+                                updateDesignAreaPurpose(area.id, value)
+                              }
+                            >
+                              <SelectTrigger>
+                                <span>Type: {area.purpose}</span>
+                              </SelectTrigger>
+                              <SelectContent>
+                                {areaPurposeOptions.map((purpose) => (
+                                  <SelectItem key={purpose} value={purpose}>
+                                    {purpose}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                            <div className="grid grid-cols-2 gap-2">
+                              <Button
+                                className="h-8"
+                                type="button"
+                                variant={linkedMeshZone ? "secondary" : "outline"}
+                                onClick={() => {
+                                  if (linkedMeshZone) {
+                                    setActiveZoneId(linkedMeshZone.id);
+                                    setUploadStatus(
+                                      `Selected mesh for ${area.label}.`
+                                    );
+                                    return;
+                                  }
+
+                                  const didCreate =
+                                    createMeshZoneForDesignArea(area.id);
+
+                                  setUploadStatus(
+                                    didCreate
+                                      ? `Created mesh layer for ${area.label}.`
+                                      : "Could not create mesh for this area."
+                                  );
+                                }}
+                              >
+                                {linkedMeshZone ? "Mesh" : "Add Mesh"}
+                              </Button>
+                              <Button
+                                className="h-8"
+                                type="button"
+                                variant="destructive"
+                                onClick={() => {
+                                  deleteDesignArea(area.id);
+                                  setUploadStatus(`${area.label} deleted.`);
+                                }}
+                              >
+                                Delete
+                              </Button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </details>
                 </div>
               </div>
             ) : null}
@@ -417,33 +608,112 @@ export function MeshZonesPanel() {
                 </div>
               </div>
             ) : null}
-            <div className="space-y-2">
-              {underlay.layers.map((layer) => (
-                <label
-                  key={layer.name}
-                  className="flex items-center justify-between gap-3 rounded-md border bg-card px-3 py-2 text-xs"
+            <details className="rounded-md border bg-card/60 p-2" open>
+              <summary className="cursor-pointer text-sm font-medium text-foreground">
+                DXF Underlay Tree
+              </summary>
+              <div className="mt-2 flex items-center justify-between gap-2 rounded-md border bg-background/50 p-2 text-xs">
+                <div className="min-w-0">
+                  <div className="truncate font-medium text-foreground">
+                    {underlay.importedFileName ?? "Imported DXF"}
+                  </div>
+                  <div className="text-muted-foreground">
+                    {underlay.layers.length} layers
+                  </div>
+                </div>
+                <Button
+                  className="h-8 px-2"
+                  type="button"
+                  variant="destructive"
+                  onClick={() => {
+                    deleteDxfUnderlay();
+                    setUploadStatus("DXF underlay deleted.");
+                  }}
                 >
-                  <span className="min-w-0">
-                    <span className="block truncate text-foreground">
-                      {layer.name}
+                  Delete
+                </Button>
+              </div>
+              <div className="mt-2 max-h-64 space-y-2 overflow-y-auto pl-3">
+                {underlay.layers.map((layer) => (
+                  <label
+                    key={layer.name}
+                    className="flex items-center justify-between gap-3 rounded-md border bg-card px-3 py-2 text-xs"
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-foreground">
+                        └ {layer.name}
+                      </span>
+                      <span className="text-muted-foreground">
+                        {layer.entityCount} entities
+                      </span>
                     </span>
-                    <span className="text-muted-foreground">
-                      {layer.entityCount} entities
-                    </span>
-                  </span>
-                  <input
-                    checked={layer.visible}
-                    className="h-4 w-4 accent-sky-500"
-                    type="checkbox"
-                    onChange={(event) =>
-                      setUnderlayLayerVisible(layer.name, event.target.checked)
-                    }
-                  />
-                </label>
-              ))}
-            </div>
+                    <input
+                      checked={layer.visible}
+                      className="h-4 w-4 accent-sky-500"
+                      type="checkbox"
+                      onChange={(event) =>
+                        setUnderlayLayerVisible(layer.name, event.target.checked)
+                      }
+                    />
+                  </label>
+                ))}
+              </div>
+            </details>
           </div>
         ) : null}
+        <details className="rounded-md border bg-background/40 p-3" open>
+          <summary className="cursor-pointer font-medium text-foreground">
+            5. Mesh Layers
+          </summary>
+          {isDrawingZone ? (
+            <div className="mt-3 rounded-md border border-primary/30 bg-primary/10 p-2 text-xs leading-5 text-primary">
+              Click and drag on the canvas to define a custom mesh layer.
+            </div>
+          ) : null}
+          <Button
+            className="mt-3 h-8 w-full gap-1"
+            variant={isDrawingZone ? "secondary" : "outline"}
+            onClick={beginDrawingZone}
+          >
+            <Plus className="h-3.5 w-3.5" />
+            {isDrawingZone ? "Drawing Mesh Area" : "Draw Custom Mesh Layer"}
+          </Button>
+          <div className="mt-3 space-y-2">
+            {meshZones.map((zone) => {
+              const targetArea = designAreas.find(
+                (area) => area.meshZoneId === zone.id
+              );
+
+              return (
+                <button
+                  key={zone.id}
+                  className={`w-full rounded-md border px-3 py-2 text-left text-sm transition ${
+                    zone.id === activeZoneId
+                      ? "border-primary bg-primary/10 text-primary"
+                      : "bg-card hover:bg-muted"
+                  }`}
+                  suppressHydrationWarning
+                  type="button"
+                  onClick={() => setActiveZoneId(zone.id)}
+                >
+                  <span className="block font-medium" suppressHydrationWarning>
+                    └ {zone.name}
+                  </span>
+                  <span
+                    className="text-xs text-muted-foreground"
+                    suppressHydrationWarning
+                  >
+                    {targetArea
+                      ? `Target: ${targetArea.label}`
+                      : zone.isMainZone
+                        ? "Target: Active slab"
+                        : zone.id}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </details>
       </div>
     </aside>
   );
@@ -581,9 +851,9 @@ export function MeshInspectorPanel() {
             </div>
             <div className="rounded-md border bg-muted/40 p-3">
               <div className="text-2xl font-semibold">
-                {slabGeometry.openings.length}
+                {(slabGeometry.designAreas ?? []).length}
               </div>
-              <div className="text-muted-foreground">Openings</div>
+              <div className="text-muted-foreground">Design areas</div>
             </div>
           </div>
 

@@ -5,6 +5,7 @@ import type {
   MeshSheetLayoutResult,
   Point,
   Polygon,
+  SlabDesignArea,
   SlabGeometry
 } from "@/types/structure";
 
@@ -46,6 +47,8 @@ type Span = {
   start: number;
   end: number;
 };
+
+const defaultPerimeterWallThickness = 400;
 
 function normalizeSpan(span: Span): Span | null {
   const start = Math.max(0, Math.min(1, Math.min(span.start, span.end)));
@@ -211,19 +214,35 @@ function getOuterCoverBoundary(slabGeometry: SlabGeometry) {
   );
 }
 
+function getMeshInteriorBoundary(slabGeometry: SlabGeometry) {
+  if (slabGeometry.meshInteriorBoundary) {
+    return slabGeometry.meshInteriorBoundary;
+  }
+
+  if (slabGeometry.dwgUnderlay && !slabGeometry.dwgUnderlay.reviewOnly) {
+    return applyConcreteCoverToBoundary(
+      slabGeometry.boundary,
+      defaultPerimeterWallThickness
+    );
+  }
+
+  return undefined;
+}
+
 function getMeshPlacementBoundary(
   slabGeometry: SlabGeometry,
   settings: BaseMeshSettings
 ) {
   const outerCoverBoundary = getOuterCoverBoundary(slabGeometry);
+  const meshInteriorBoundary = getMeshInteriorBoundary(slabGeometry);
 
-  if (!slabGeometry.meshInteriorBoundary) {
+  if (!meshInteriorBoundary) {
     return outerCoverBoundary;
   }
 
   return interpolateBoundary(
-    slabGeometry.meshInteriorBoundary,
     outerCoverBoundary,
+    meshInteriorBoundary,
     settings.wallAnchorageDepth
   );
 }
@@ -254,15 +273,28 @@ function getOpeningExclusionPolygons(
   slabGeometry: SlabGeometry,
   settings: BaseMeshSettings
 ) {
-  return slabGeometry.openings.map((opening) =>
-    expandAxisAlignedVoid(
+  const structuralOpeningExclusions = slabGeometry.openings.map((opening) => {
+    if (opening.wallThickness === 0) {
+      return opening.polygon;
+    }
+
+    return expandAxisAlignedVoid(
       opening.polygon,
       Math.max(
         slabGeometry.concreteCover,
         (opening.wallThickness ?? 250) - settings.wallAnchorageDepth
       )
-    )
-  );
+    );
+  });
+  const designAreaExclusions = (slabGeometry.designAreas ?? [])
+    .filter(isMeshExclusionArea)
+    .map((area) => area.polygon);
+
+  return [...structuralOpeningExclusions, ...designAreaExclusions];
+}
+
+function isMeshExclusionArea(area: SlabDesignArea) {
+  return area.purpose === "void" || area.purpose === "no-mesh";
 }
 
 export function getActiveSheetDimensions(settings: BaseMeshSettings) {

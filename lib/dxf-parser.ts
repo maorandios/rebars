@@ -1801,6 +1801,7 @@ export function slabGeometryFromBoundaryLayer(
   return {
     ...current,
     boundary: selected.polygon,
+    designAreas: current.designAreas ?? [],
     hasActiveSlabBoundary: true,
     meshBoundary: undefined,
     meshInteriorBoundary: undefined,
@@ -1902,6 +1903,7 @@ export function slabGeometryFromVisibleUnderlayLayers(
       lines: [...retainedLines, ...generatedLines],
       reviewOnly: true
     },
+    designAreas: current.designAreas ?? [],
     hasActiveSlabBoundary: true,
     meshBoundary: undefined,
     meshInteriorBoundary: undefined,
@@ -1930,6 +1932,7 @@ export function parseDxfToSlabGeometry(
     slabGeometry: {
       boundary: fallbackBoundaryFromUnderlay(underlay),
       concreteCover: 30,
+      designAreas: [],
       dwgUnderlay: underlay,
       hasActiveSlabBoundary: false,
       openings: [],

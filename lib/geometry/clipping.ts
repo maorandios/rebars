@@ -51,29 +51,82 @@ export function pointInPolygon(point: Point, polygon: Polygon) {
   return inside;
 }
 
-export function applyConcreteCoverToBoundary(boundary: Polygon, cover: number) {
-  const centroid = boundary.reduce(
-    (sum, point) => ({ x: sum.x + point.x, y: sum.y + point.y }),
-    { x: 0, y: 0 }
-  );
-  centroid.x /= boundary.length;
-  centroid.y /= boundary.length;
+function signedPolygonArea(polygon: Polygon) {
+  return polygon.reduce((sum, point, index) => {
+    const next = polygon[(index + 1) % polygon.length];
 
-  // Phase 1 approximation: move vertices toward the polygon centroid.
-  // The clipping API stays stable for a later true offset-polygon replacement.
-  return boundary.map((point) => {
-    const dx = centroid.x - point.x;
-    const dy = centroid.y - point.y;
+    return sum + point.x * next.y - next.x * point.y;
+  }, 0);
+}
+
+function intersectInfiniteLines(
+  firstStart: Point,
+  firstEnd: Point,
+  secondStart: Point,
+  secondEnd: Point
+) {
+  const firstDx = firstEnd.x - firstStart.x;
+  const firstDy = firstEnd.y - firstStart.y;
+  const secondDx = secondEnd.x - secondStart.x;
+  const secondDy = secondEnd.y - secondStart.y;
+  const denominator = firstDx * secondDy - firstDy * secondDx;
+
+  if (Math.abs(denominator) < 0.000001) {
+    return null;
+  }
+
+  const t =
+    ((secondStart.x - firstStart.x) * secondDy -
+      (secondStart.y - firstStart.y) * secondDx) /
+    denominator;
+
+  return {
+    x: firstStart.x + firstDx * t,
+    y: firstStart.y + firstDy * t
+  };
+}
+
+export function applyConcreteCoverToBoundary(boundary: Polygon, cover: number) {
+  if (boundary.length < 3 || cover <= 0) {
+    return boundary;
+  }
+
+  const area = signedPolygonArea(boundary);
+  const inwardSign = area >= 0 ? 1 : -1;
+  const offsetEdges = boundary.map((start, index) => {
+    const end = boundary[(index + 1) % boundary.length];
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
     const length = Math.hypot(dx, dy);
 
     if (length === 0) {
-      return point;
+      return { end, start };
     }
 
-    return {
-      x: point.x + (dx / length) * cover,
-      y: point.y + (dy / length) * cover
+    const normal = {
+      x: (-dy / length) * cover * inwardSign,
+      y: (dx / length) * cover * inwardSign
     };
+
+    return {
+      start: { x: start.x + normal.x, y: start.y + normal.y },
+      end: { x: end.x + normal.x, y: end.y + normal.y }
+    };
+  });
+
+  return boundary.map((point, index) => {
+    const previousEdge =
+      offsetEdges[(index - 1 + offsetEdges.length) % offsetEdges.length];
+    const currentEdge = offsetEdges[index];
+
+    return (
+      intersectInfiniteLines(
+        previousEdge.start,
+        previousEdge.end,
+        currentEdge.start,
+        currentEdge.end
+      ) ?? point
+    );
   });
 }
 

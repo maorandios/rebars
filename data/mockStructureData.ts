@@ -319,6 +319,7 @@ export const mockSlabGeometry: SlabGeometry = {
     { x: 2_000 + perimeterWallThickness, y: 15_000 - perimeterWallThickness },
     { x: perimeterWallThickness, y: 15_000 - perimeterWallThickness }
   ],
+  designAreas: [],
   openings: [
     {
       id: "OP-ELEV-01",
