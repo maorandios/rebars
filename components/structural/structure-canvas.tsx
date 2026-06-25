@@ -266,11 +266,10 @@ function drawCadArc(
   resetDraftStroke(context);
 }
 
-function visibleUnderlayLayers(slabGeometry: SlabGeometry) {
+function visibleUnderlayLayers(underlay: NonNullable<SlabGeometry["dwgUnderlay"]>) {
   return new Set(
-    slabGeometry.dwgUnderlay?.layers
-      ?.filter((layer) => layer.visible)
-      .map((layer) => layer.name) ?? []
+    underlay.layers?.filter((layer) => layer.visible).map((layer) => layer.name) ??
+      []
   );
 }
 
@@ -370,35 +369,63 @@ function drawDwgUnderlay(
   slabGeometry: SlabGeometry,
   scale: number
 ) {
-  if (!slabGeometry.dwgUnderlay) {
+  const dxfReferences =
+    slabGeometry.dxfUnderlays ??
+    (slabGeometry.dwgUnderlay?.importedFileName ? [slabGeometry.dwgUnderlay] : []);
+  const calculatedUnderlay = slabGeometry.dwgUnderlay;
+
+  if (!dxfReferences.length && !calculatedUnderlay) {
     return;
   }
 
   context.save();
   context.globalAlpha = 0.38;
-  const visibleLayers = visibleUnderlayLayers(slabGeometry);
 
-  for (const line of slabGeometry.dwgUnderlay.lines) {
-    if (isLayerVisible(visibleLayers, line.layer)) {
-      drawCadLine(context, line, scale);
+  for (const underlay of dxfReferences) {
+    if (underlay.visible === false) {
+      continue;
     }
+
+    const offset = underlay.offset ?? { x: 0, y: 0 };
+    const visibleLayers = visibleUnderlayLayers(underlay);
+
+    context.save();
+    context.translate(offset.x, offset.y);
+    for (const line of underlay.lines) {
+      if (isLayerVisible(visibleLayers, line.layer)) {
+        drawCadLine(context, line, scale);
+      }
+    }
+
+    for (const text of underlay.texts) {
+      if (isLayerVisible(visibleLayers, text.layer)) {
+        drawCadText(context, text, scale);
+      }
+    }
+
+    for (const circle of underlay.circles ?? []) {
+      if (isLayerVisible(visibleLayers, circle.layer)) {
+        drawCadCircle(context, circle, scale);
+      }
+    }
+
+    for (const arc of underlay.arcs ?? []) {
+      if (isLayerVisible(visibleLayers, arc.layer)) {
+        drawCadArc(context, arc, scale);
+      }
+    }
+    context.restore();
   }
 
-  for (const text of slabGeometry.dwgUnderlay.texts) {
-    if (isLayerVisible(visibleLayers, text.layer)) {
-      drawCadText(context, text, scale);
-    }
-  }
-
-  for (const circle of slabGeometry.dwgUnderlay.circles ?? []) {
-    if (isLayerVisible(visibleLayers, circle.layer)) {
-      drawCadCircle(context, circle, scale);
-    }
-  }
-
-  for (const arc of slabGeometry.dwgUnderlay.arcs ?? []) {
-    if (isLayerVisible(visibleLayers, arc.layer)) {
-      drawCadArc(context, arc, scale);
+  if (calculatedUnderlay) {
+    const visibleLayers = visibleUnderlayLayers(calculatedUnderlay);
+    for (const line of calculatedUnderlay.lines) {
+      if (
+        line.layer === calculatedSlabLayer &&
+        isLayerVisible(visibleLayers, line.layer)
+      ) {
+        drawCadLine(context, line, scale);
+      }
     }
   }
 
@@ -1007,6 +1034,13 @@ export function StructureCanvas() {
     panX: canvasPadding,
     panY: canvasPadding
   });
+  const dxfDragRef = useRef<{
+    id: string | null;
+    lastPoint: Point | null;
+  }>({
+    id: null,
+    lastPoint: null
+  });
   const [viewScale, setViewScale] = useState(initialScale);
   const [canvasSize, setCanvasSize] = useState({ height: 1, width: 1 });
   const [snapPoint, setSnapPoint] = useState<Point | null>(null);
@@ -1015,6 +1049,7 @@ export function StructureCanvas() {
     meshZones,
     activeZoneId,
     activeMeshZone,
+    activeDxfUnderlayId,
     isDrawingZone,
     isDrawingBoundary,
     isEditingBoundary,
@@ -1030,6 +1065,8 @@ export function StructureCanvas() {
     commitDrawnMeshZone,
     finishBoundaryTrace,
     finishDesignAreaDraft,
+    setActiveDxfUnderlayId,
+    translateDxfUnderlay,
     updateCalculatedBoundaryPoint,
     updateDesignAreaPoint,
     updateActiveMeshZoneParameters
@@ -1090,6 +1127,34 @@ export function StructureCanvas() {
     drawStructuralBackground(context, slabGeometry, scaleRef.current);
     if (slabGeometry.hasActiveSlabBoundary ?? true) {
       if (slabGeometry.dwgUnderlay?.reviewOnly) {
+        if (slabGeometry.hasActiveSlabBoundary) {
+          const areaMeshZones = meshZones.filter((zone) => !zone.isMainZone);
+
+          if (areaMeshZones.length > 0) {
+            drawMeshSheets(
+              context,
+              slabGeometry,
+              areaMeshZones,
+              activeZoneId,
+              scaleRef.current
+            );
+          }
+          if (isCalculatedSlabVisible(slabGeometry) || isEditingBoundary) {
+            drawSlabGeometry(context, slabGeometry, scaleRef.current);
+          }
+          drawDesignAreas(context, slabGeometry, scaleRef.current);
+          const editingDesignArea = (slabGeometry.designAreas ?? []).find(
+            (area) => area.id === editingDesignAreaId
+          );
+
+          if (editingDesignArea) {
+            drawDesignAreaEditHandles(
+              context,
+              editingDesignArea,
+              scaleRef.current
+            );
+          }
+        }
         drawBoundaryTrace(
           context,
           boundaryDraftPoints,
@@ -1253,20 +1318,54 @@ export function StructureCanvas() {
 
     const snapToDxfVertex = (worldPoint: Point) => {
       const snapRadius = screenPx(15, scaleRef.current);
-      const vertices = slabGeometry.dwgUnderlay?.dxfVertices ?? [];
+      const references =
+        slabGeometry.dxfUnderlays ??
+        (slabGeometry.dwgUnderlay?.importedFileName
+          ? [slabGeometry.dwgUnderlay]
+          : []);
       let closest: Point | null = null;
       let closestDistance = Number.POSITIVE_INFINITY;
 
-      for (const vertex of vertices) {
-        const nextDistance = distance(worldPoint, vertex);
+      for (const reference of references) {
+        if (reference.visible === false) {
+          continue;
+        }
+        const offset = reference.offset ?? { x: 0, y: 0 };
 
-        if (nextDistance < closestDistance) {
-          closest = vertex;
-          closestDistance = nextDistance;
+        for (const vertex of reference.dxfVertices ?? []) {
+          const offsetVertex = {
+            x: vertex.x + offset.x,
+            y: vertex.y + offset.y
+          };
+          const nextDistance = distance(worldPoint, offsetVertex);
+
+          if (nextDistance < closestDistance) {
+            closest = offsetVertex;
+            closestDistance = nextDistance;
+          }
         }
       }
 
       return closest && closestDistance <= snapRadius ? closest : null;
+    };
+
+    const activeDxfUnderlayAt = (worldPoint: Point) => {
+      const underlay = (slabGeometry.dxfUnderlays ?? []).find(
+        (reference) => reference.id === activeDxfUnderlayId
+      );
+
+      if (!underlay?.bounds || underlay.visible === false) {
+        return null;
+      }
+
+      const offset = underlay.offset ?? { x: 0, y: 0 };
+
+      return worldPoint.x >= underlay.bounds.minX + offset.x &&
+        worldPoint.x <= underlay.bounds.maxX + offset.x &&
+        worldPoint.y >= underlay.bounds.minY + offset.y &&
+        worldPoint.y <= underlay.bounds.maxY + offset.y
+        ? underlay
+        : null;
     };
 
     const boundaryVertexAt = (worldPoint: Point) => {
@@ -1497,10 +1596,45 @@ export function StructureCanvas() {
         return;
       }
 
+      if (activeDxfUnderlayId && event.button === 0) {
+        const worldPoint = eventToWorldPoint(event);
+        const activeUnderlay = activeDxfUnderlayAt(worldPoint);
+
+        if (!activeUnderlay?.id) {
+          return;
+        }
+
+        try {
+          container.setPointerCapture(event.pointerId);
+        } catch {
+          // Synthetic/test pointer events may not have an active pointer capture.
+        }
+
+        setActiveDxfUnderlayId(activeUnderlay.id);
+        dxfDragRef.current = {
+          id: activeUnderlay.id,
+          lastPoint: worldPoint
+        };
+        return;
+      }
+
       // Left click is reserved for future picking; zone selection stays sidebar-only.
     };
 
     const handlePointerMove = (event: PointerEvent) => {
+      if (dxfDragRef.current.id && dxfDragRef.current.lastPoint) {
+        const worldPoint = eventToWorldPoint(event);
+        const delta = {
+          x: worldPoint.x - dxfDragRef.current.lastPoint.x,
+          y: worldPoint.y - dxfDragRef.current.lastPoint.y
+        };
+
+        translateDxfUnderlay(dxfDragRef.current.id, delta);
+        dxfDragRef.current.lastPoint = worldPoint;
+        renderCanvas();
+        return;
+      }
+
       if (isDrawingDesignArea && designAreaRectangleDraftRef.current?.isDragging) {
         designAreaRectangleDraftRef.current = {
           ...designAreaRectangleDraftRef.current,
@@ -1606,6 +1740,20 @@ export function StructureCanvas() {
         return;
       }
 
+      if (dxfDragRef.current.id) {
+        dxfDragRef.current = {
+          id: null,
+          lastPoint: null
+        };
+        try {
+          container.releasePointerCapture(event.pointerId);
+        } catch {
+          // Pointer capture may not exist for synthetic/test events.
+        }
+        renderCanvas();
+        return;
+      }
+
       if (!dragRef.current.isDragging) {
         return;
       }
@@ -1640,6 +1788,7 @@ export function StructureCanvas() {
   }, [
     addBoundaryTracePoint,
     addDesignAreaDraftPoint,
+    activeDxfUnderlayId,
     boundaryDraftPoints,
     cancelDrawingZone,
     commitDesignAreaPolygon,
@@ -1656,8 +1805,12 @@ export function StructureCanvas() {
     designAreaDrawingMode,
     slabGeometry.boundary,
     slabGeometry.designAreas,
+    slabGeometry.dxfUnderlays,
+    slabGeometry.dwgUnderlay,
     slabGeometry.dwgUnderlay?.dxfVertices,
     renderCanvas,
+    setActiveDxfUnderlayId,
+    translateDxfUnderlay,
     updateCalculatedBoundaryPoint,
     updateDesignAreaPoint
   ]);
@@ -1761,14 +1914,14 @@ export function StructureCanvas() {
       ) : null}
       {editingDesignAreaId ? (
         <div className="pointer-events-none absolute left-1/2 top-20 z-10 max-w-md -translate-x-1/2 rounded-md border border-amber-400/30 bg-background/90 px-4 py-2 text-sm font-medium text-amber-300 shadow-sm backdrop-blur">
-          Drag amber area points to edit the design area
+          Drag amber area points to edit the no-mesh area
         </div>
       ) : null}
       {isDrawingDesignArea ? (
         <div className="pointer-events-none absolute left-1/2 top-20 z-10 max-w-md -translate-x-1/2 rounded-md border border-amber-400/30 bg-background/90 px-4 py-2 text-sm font-medium text-amber-300 shadow-sm backdrop-blur">
           {designAreaDrawingMode === "rectangle"
-            ? "Drag a rectangular design area. Default purpose: no mesh."
-            : "Click DXF vertices to trace a design area, then finish."}
+            ? "Drag a rectangular no-mesh area."
+            : "Click DXF vertices to trace a no-mesh area, then finish."}
         </div>
       ) : null}
     </div>

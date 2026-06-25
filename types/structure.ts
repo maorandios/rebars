@@ -68,12 +68,15 @@ export type DwgUnderlay = {
   };
   circles?: CadCircleEntity[];
   closedPolylines?: CadClosedPolylineCandidate[];
+  id?: string;
   importedFileName?: string;
+  offset?: Point;
   reviewOnly?: boolean;
   dxfVertices?: Point[];
   layers?: DwgUnderlayLayer[];
   lines: CadLineEntity[];
   texts: CadTextEntity[];
+  visible?: boolean;
 };
 
 export type SlabOpening = {
@@ -119,6 +122,7 @@ export type SlabGeometry = {
   meshBoundary?: Polygon;
   meshInteriorBoundary?: Polygon;
   dwgUnderlay?: DwgUnderlay;
+  dxfUnderlays?: DwgUnderlay[];
   designAreas?: SlabDesignArea[];
   openings: SlabOpening[];
   structuralElements: StructuralElement[];
