@@ -31,6 +31,7 @@ import { useReinforcement } from "@/context/reinforcement-context";
 import { mockBaseMeshSettings } from "@/data/mockStructureData";
 import { parseDxfToSlabGeometry } from "@/lib/dxf-parser";
 import { compareBaseMeshOrientations } from "@/lib/geometry/mesh-sheet-layout";
+import { removeSlabGeometryProject } from "@/lib/project-storage";
 import type { BaseMeshSettings, BaseMeshSettingsUpdate } from "@/types/structure";
 
 const diameterOptions: BaseMeshSettings["diameter"][] = [8, 10, 12];
@@ -41,8 +42,6 @@ const originOptions: BaseMeshSettings["originCorner"][] = [
   "top-left",
   "top-right"
 ];
-const importedProjectStorageKey = "rebars.importedSlabGeometry";
-
 type NumericDraftValues = {
   sheetWidth: string;
   sheetLength: string;
@@ -64,7 +63,7 @@ export type InspectorContext =
   | { type: "area"; areaId: string }
   | { type: "mesh"; zoneId?: string };
 
-export type DockSection = "dxf" | "slab" | "mesh";
+export type DockSection = "dxf" | "slab" | "mesh" | "analysis";
 
 type PanelProps = {
   activeDock: DockSection;
@@ -108,7 +107,12 @@ export function MeshZonesPanel({
     deleteDxfUnderlay,
     setActiveDxfUnderlayId,
     setDxfUnderlayLayerVisible,
+    setDxfUnderlayScale,
     setDxfUnderlayVisible,
+    setStrapLayer,
+    deleteStrapLayer,
+    generateRawDeficitZones,
+    translateDxfUnderlay,
     setSelectedDesignAreaId,
     setActiveZoneId
   } = useReinforcement();
@@ -116,6 +120,12 @@ export function MeshZonesPanel({
     {}
   );
   const [dxfUploadStatus, setDxfUploadStatus] = useState<string | null>(null);
+  const [isStrapModalOpen, setIsStrapModalOpen] = useState(false);
+  const [rawStrapDxfX, setRawStrapDxfX] = useState<string | null>(null);
+  const [rawStrapDxfY, setRawStrapDxfY] = useState<string | null>(null);
+  const [strapFileNameX, setStrapFileNameX] = useState<string | null>(null);
+  const [strapFileNameY, setStrapFileNameY] = useState<string | null>(null);
+  const [strapUploadStatus, setStrapUploadStatus] = useState<string | null>(null);
   const underlay = slabGeometry.dwgUnderlay;
   const hasActiveSlabBoundary = slabGeometry.hasActiveSlabBoundary ?? true;
   const calculatedSlabLayer = underlay?.layers?.find(
@@ -134,6 +144,20 @@ export function MeshZonesPanel({
     hasGeneratedWorkingSlab && slabGeometry.dwgUnderlay?.reviewOnly === false
   );
   const visibleMeshZones = hasMainMeshApplied ? meshZones : nonMainMeshZones;
+  const strapLayers = [
+    {
+      axis: "x" as const,
+      color: "text-fuchsia-300",
+      layer: slabGeometry.strapLayerX,
+      label: "STRAP X Axis"
+    },
+    {
+      axis: "y" as const,
+      color: "text-orange-300",
+      layer: slabGeometry.strapLayerY,
+      label: "STRAP Y Axis"
+    }
+  ];
   async function handleAdditionalDxfUpload(file: File | undefined) {
     if (!file) {
       return;
@@ -157,20 +181,77 @@ export function MeshZonesPanel({
       );
     }
   }
+
+  async function handleStrapFile(axis: "x" | "y", file: File | undefined) {
+    if (!file) {
+      return;
+    }
+
+    const rawDxf = await file.text();
+
+    if (axis === "x") {
+      setRawStrapDxfX(rawDxf);
+      setStrapFileNameX(file.name);
+    } else {
+      setRawStrapDxfY(rawDxf);
+      setStrapFileNameY(file.name);
+    }
+  }
+
+  function loadStrapFilesToCanvas() {
+    try {
+      if (rawStrapDxfX && strapFileNameX) {
+        const parsedX = parseDxfToSlabGeometry(rawStrapDxfX, strapFileNameX);
+        const underlayX = parsedX.slabGeometry.dwgUnderlay;
+
+        if (underlayX) {
+          setStrapLayer("x", {
+            ...underlayX,
+            importedFileName: strapFileNameX
+          });
+        }
+      }
+
+      if (rawStrapDxfY && strapFileNameY) {
+        const parsedY = parseDxfToSlabGeometry(rawStrapDxfY, strapFileNameY);
+        const underlayY = parsedY.slabGeometry.dwgUnderlay;
+
+        if (underlayY) {
+          setStrapLayer("y", {
+            ...underlayY,
+            importedFileName: strapFileNameY
+          });
+        }
+      }
+
+      setStrapUploadStatus("STRAP analysis layers loaded to canvas.");
+      setIsStrapModalOpen(false);
+    } catch (error) {
+      setStrapUploadStatus(
+        error instanceof Error ? error.message : "Failed to parse STRAP DXF files."
+      );
+    }
+  }
+
   const title =
     activeDock === "dxf"
       ? "DXF Layers"
       : activeDock === "slab"
         ? "Slab View"
-        : "Mesh Layers";
+        : activeDock === "analysis"
+          ? "אנליזה"
+          : "Mesh Layers";
   const description =
     activeDock === "dxf"
       ? "Reference drawing layers and visibility targets."
       : activeDock === "slab"
         ? "Working slab and opening/design-area layers."
-        : "Base mesh layers that can stack on the slab.";
+        : activeDock === "analysis"
+          ? "Load and align STRAP X/Y analysis DXF underlays."
+          : "Base mesh layers that can stack on the slab.";
 
   return (
+    <>
     <aside className="flex h-full w-80 shrink-0 flex-col border-r bg-card/80 shadow-2xl shadow-black/25 backdrop-blur-xl">
       <div className="border-b bg-background/45 p-5">
         <div className="flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-muted-foreground">
@@ -184,7 +265,7 @@ export function MeshZonesPanel({
       </div>
 
       <div className="workflow-scrollbar flex-1 overflow-y-auto px-4 py-5">
-        {!hasImportedDxf ? (
+        {!hasImportedDxf && activeDock !== "analysis" ? (
           <div className="rounded-2xl border border-dashed p-4 text-sm leading-6 text-muted-foreground">
             No DXF project is loaded. Start from the homepage and upload a DXF
             reference.
@@ -269,9 +350,7 @@ export function MeshZonesPanel({
                       onClick={() => {
                         if (dxfReferences.length <= 1) {
                           deleteDxfUnderlay();
-                          window.sessionStorage.removeItem(
-                            importedProjectStorageKey
-                          );
+                          void removeSlabGeometryProject();
                         } else {
                           deleteDxfUnderlayById(referenceId);
                         }
@@ -279,6 +358,50 @@ export function MeshZonesPanel({
                     >
                       Delete
                     </Button>
+                  </div>
+                  <div className="mt-3 rounded-xl border bg-background/50 p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <Label
+                        className="text-xs font-medium text-muted-foreground"
+                        htmlFor={`dxf-scale-${referenceId}`}
+                      >
+                        DXF scale
+                      </Label>
+                      <span className="text-xs text-muted-foreground">
+                        {(reference.scale ?? 1).toLocaleString(undefined, {
+                          maximumFractionDigits: 4
+                        })}
+                        x
+                      </span>
+                    </div>
+                    <Input
+                      className="mt-2 h-8"
+                      id={`dxf-scale-${referenceId}`}
+                      min={0.0001}
+                      step={0.01}
+                      type="number"
+                      value={reference.scale ?? 1}
+                      onChange={(event) => {
+                        const nextScale = Number(event.target.value);
+
+                        if (nextScale > 0) {
+                          setDxfUnderlayScale(referenceId, nextScale);
+                        }
+                      }}
+                    />
+                    <div className="mt-2 grid grid-cols-4 gap-1">
+                      {[0.001, 0.01, 0.1, 1, 10, 100, 1000].map((scale) => (
+                        <Button
+                          key={scale}
+                          className="h-7 px-2 text-[11px]"
+                          type="button"
+                          variant="outline"
+                          onClick={() => setDxfUnderlayScale(referenceId, scale)}
+                        >
+                          {scale}x
+                        </Button>
+                      ))}
+                    </div>
                   </div>
                   {isExpanded ? (
                     <div className="mt-3 space-y-2">
@@ -325,6 +448,267 @@ export function MeshZonesPanel({
                           />
                         </label>
                       ))}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+
+        {activeDock === "analysis" ? (
+          <div className="space-y-4">
+            <Button
+              className="h-12 w-full text-base font-semibold"
+              type="button"
+              onClick={() => setIsStrapModalOpen(true)}
+            >
+              טען קבצי STRAP
+            </Button>
+            {strapUploadStatus ? (
+              <div className="rounded-xl border border-primary/20 bg-primary/10 p-3 text-xs leading-5 text-foreground">
+                {strapUploadStatus}
+              </div>
+            ) : null}
+            <div className="rounded-2xl border bg-background/60 p-4">
+              <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">
+                Underlay Layers - STRAP
+              </div>
+              <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                Load X and Y STRAP DXF files independently, then scale and shift
+                each one until it aligns with the working slab.
+              </p>
+            </div>
+            <div className="rounded-2xl border border-red-400/25 bg-red-400/10 p-4">
+              <div className="text-sm font-semibold text-foreground">
+                Raw Deficit Windows
+              </div>
+              <p className="mt-2 text-xs leading-5 text-red-100/80">
+                Hardcoded base capacity: 393. This validation pass only draws
+                simple red bounding rectangles around STRAP labels above that
+                value.
+              </p>
+              <Button
+                className="mt-3 w-full"
+                disabled={!slabGeometry.strapLayerX && !slabGeometry.strapLayerY}
+                type="button"
+                variant="secondary"
+                onClick={() => {
+                  const zoneCount = generateRawDeficitZones();
+                  setStrapUploadStatus(
+                    `Generated ${zoneCount} raw deficit window${
+                      zoneCount === 1 ? "" : "s"
+                    }.`
+                  );
+                }}
+              >
+                Generate Raw Deficit Zones
+              </Button>
+              <div className="mt-2 text-xs text-muted-foreground">
+                Current zones: {slabGeometry.rawDeficitZones?.length ?? 0}
+              </div>
+            </div>
+            {strapLayers.map(({ axis, color, label, layer }) => {
+              const layerId = layer?.id ?? `strap-${axis}`;
+              const layers = layer?.layers ?? [];
+              const areAllLayersHidden =
+                layers.length > 0 && layers.every((item) => !item.visible);
+
+              return (
+                <div
+                  key={axis}
+                  className={`rounded-2xl border p-3 ${
+                    activeDxfUnderlayId === layerId
+                      ? "border-primary/50 bg-primary/10"
+                      : "bg-background/60"
+                  }`}
+                >
+                  <button
+                    className="flex w-full items-start gap-3 text-left"
+                    disabled={!layer}
+                    type="button"
+                    onClick={() => setActiveDxfUnderlayId(layerId)}
+                  >
+                    <FileStack className={`mt-0.5 h-5 w-5 shrink-0 ${color}`} />
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-sm font-semibold text-foreground">
+                        {label}
+                      </span>
+                      <span className="mt-1 block truncate text-xs text-muted-foreground">
+                        {layer
+                          ? `${layer.importedFileName ?? "STRAP DXF"} | ${layers.length} layers | drag selected layer`
+                          : "No STRAP DXF loaded yet"}
+                      </span>
+                    </span>
+                  </button>
+
+                  {layer ? (
+                    <div className="mt-3 space-y-3">
+                      <div className="grid grid-cols-2 gap-2">
+                        <Button
+                          className="h-8"
+                          type="button"
+                          variant="secondary"
+                          onClick={() =>
+                            setDxfUnderlayVisible(layerId, layer.visible === false)
+                          }
+                        >
+                          {layer.visible === false ? "Show" : "Hide"}
+                        </Button>
+                        <Button
+                          className="h-8"
+                          type="button"
+                          variant="destructive"
+                          onClick={() => deleteStrapLayer(axis)}
+                        >
+                          Delete
+                        </Button>
+                      </div>
+
+                      <div className="rounded-xl border bg-background/50 p-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <Label
+                            className="text-xs font-medium text-muted-foreground"
+                            htmlFor={`strap-scale-${axis}`}
+                          >
+                            Ratio / Scale
+                          </Label>
+                          <span className="text-xs text-muted-foreground">
+                            {(layer.scale ?? 1).toLocaleString(undefined, {
+                              maximumFractionDigits: 4
+                            })}
+                            x
+                          </span>
+                        </div>
+                        <Input
+                          className="mt-2 h-8"
+                          id={`strap-scale-${axis}`}
+                          min={0.0001}
+                          step={0.01}
+                          type="number"
+                          value={layer.scale ?? 1}
+                          onChange={(event) => {
+                            const nextScale = Number(event.target.value);
+
+                            if (nextScale > 0) {
+                              setDxfUnderlayScale(layerId, nextScale);
+                            }
+                          }}
+                        />
+                        <div className="mt-2 grid grid-cols-4 gap-1">
+                          {[0.001, 0.01, 0.1, 1, 10, 100, 1000].map((scale) => (
+                            <Button
+                              key={scale}
+                              className="h-7 px-2 text-[11px]"
+                              type="button"
+                              variant="outline"
+                              onClick={() => setDxfUnderlayScale(layerId, scale)}
+                            >
+                              {scale}x
+                            </Button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border bg-background/50 p-3">
+                        <div className="text-xs font-medium text-muted-foreground">
+                          Position Shift
+                        </div>
+                        <div className="mt-2 grid grid-cols-4 gap-1">
+                          <Button
+                            className="h-8 px-2 text-xs"
+                            type="button"
+                            variant="outline"
+                            onClick={() =>
+                              translateDxfUnderlay(layerId, { x: -100, y: 0 })
+                            }
+                          >
+                            X -100
+                          </Button>
+                          <Button
+                            className="h-8 px-2 text-xs"
+                            type="button"
+                            variant="outline"
+                            onClick={() =>
+                              translateDxfUnderlay(layerId, { x: 100, y: 0 })
+                            }
+                          >
+                            X +100
+                          </Button>
+                          <Button
+                            className="h-8 px-2 text-xs"
+                            type="button"
+                            variant="outline"
+                            onClick={() =>
+                              translateDxfUnderlay(layerId, { x: 0, y: -100 })
+                            }
+                          >
+                            Y -100
+                          </Button>
+                          <Button
+                            className="h-8 px-2 text-xs"
+                            type="button"
+                            variant="outline"
+                            onClick={() =>
+                              translateDxfUnderlay(layerId, { x: 0, y: 100 })
+                            }
+                          >
+                            Y +100
+                          </Button>
+                        </div>
+                        <div className="mt-2 text-xs text-muted-foreground">
+                          Offset X {Math.round(layer.offset?.x ?? 0)} | Y{" "}
+                          {Math.round(layer.offset?.y ?? 0)}
+                        </div>
+                      </div>
+
+                      {layers.length > 0 ? (
+                        <div className="space-y-2">
+                          <Button
+                            className="h-8 w-full"
+                            type="button"
+                            variant="outline"
+                            onClick={() =>
+                              layers.forEach((item) =>
+                                setDxfUnderlayLayerVisible(
+                                  layerId,
+                                  item.name,
+                                  areAllLayersHidden
+                                )
+                              )
+                            }
+                          >
+                            {areAllLayersHidden ? "Show All Layers" : "Hide All Layers"}
+                          </Button>
+                          {layers.map((item) => (
+                            <label
+                              key={item.name}
+                              className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border bg-background/50 px-3 py-2 text-left transition hover:border-primary/30 hover:bg-primary/5"
+                            >
+                              <span className="min-w-0">
+                                <span className="block truncate text-xs font-medium text-foreground">
+                                  {item.name}
+                                </span>
+                                <span className="mt-1 block text-xs text-muted-foreground">
+                                  {item.entityCount} entities
+                                </span>
+                              </span>
+                              <input
+                                checked={item.visible}
+                                className="h-4 w-4 shrink-0 accent-sky-500"
+                                type="checkbox"
+                                onChange={(event) =>
+                                  setDxfUnderlayLayerVisible(
+                                    layerId,
+                                    item.name,
+                                    event.target.checked
+                                  )
+                                }
+                              />
+                            </label>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
                   ) : null}
                 </div>
@@ -461,6 +845,97 @@ export function MeshZonesPanel({
       </div>
 
     </aside>
+    {isStrapModalOpen ? (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 backdrop-blur-sm">
+        <div className="w-full max-w-2xl overflow-hidden rounded-3xl border border-primary/20 bg-card shadow-2xl shadow-black/50">
+          <div className="border-b bg-background/60 p-5">
+            <div className="text-xs font-medium uppercase tracking-[0.18em] text-primary">
+              STRAP Analysis DXF
+            </div>
+            <div className="mt-2 flex items-center justify-between gap-4">
+              <div>
+                <h3 className="text-xl font-semibold text-foreground">
+                  טען קבצי STRAP
+                </h3>
+                <p className="mt-1 text-sm leading-6 text-muted-foreground">
+                  Load X and Y analysis files as two independent canvas underlays.
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setIsStrapModalOpen(false)}
+              >
+                Close
+              </Button>
+            </div>
+          </div>
+
+          <div className="grid gap-4 p-5 md:grid-cols-2">
+            <label className="flex min-h-44 cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed border-fuchsia-300/40 bg-fuchsia-300/10 p-5 text-center transition hover:border-fuchsia-300 hover:bg-fuchsia-300/15">
+              <FileStack className="h-8 w-8 text-fuchsia-300" />
+              <span className="mt-3 text-sm font-semibold text-foreground">
+                קובץ אנליזה ציר X (.dxf)
+              </span>
+              <span className="mt-2 max-w-full truncate text-xs text-muted-foreground">
+                {strapFileNameX ?? "Choose DXF file"}
+              </span>
+              <Input
+                accept=".dxf"
+                className="hidden"
+                type="file"
+                onChange={(event) => {
+                  void handleStrapFile("x", event.target.files?.[0]);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+
+            <label className="flex min-h-44 cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed border-orange-300/40 bg-orange-300/10 p-5 text-center transition hover:border-orange-300 hover:bg-orange-300/15">
+              <FileStack className="h-8 w-8 text-orange-300" />
+              <span className="mt-3 text-sm font-semibold text-foreground">
+                קובץ אנליזה ציר Y (.dxf)
+              </span>
+              <span className="mt-2 max-w-full truncate text-xs text-muted-foreground">
+                {strapFileNameY ?? "Choose DXF file"}
+              </span>
+              <Input
+                accept=".dxf"
+                className="hidden"
+                type="file"
+                onChange={(event) => {
+                  void handleStrapFile("y", event.target.files?.[0]);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+          </div>
+
+          <div className="flex items-center justify-between border-t bg-background/50 p-5">
+            <p className="text-xs leading-5 text-muted-foreground">
+              You can load one file now and add the second later.
+            </p>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setIsStrapModalOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                disabled={!rawStrapDxfX && !rawStrapDxfY}
+                type="button"
+                onClick={loadStrapFilesToCanvas}
+              >
+                טען לקנבס
+              </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    ) : null}
+    </>
   );
 }
 

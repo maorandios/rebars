@@ -15,8 +15,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { useReinforcement } from "@/context/reinforcement-context";
 import { parseDxfToSlabGeometry } from "@/lib/dxf-parser";
-
-const importedProjectStorageKey = "rebars.importedSlabGeometry";
+import { saveSlabGeometryProject } from "@/lib/project-storage";
 
 export default function DashboardPage() {
   const router = useRouter();
@@ -37,10 +36,7 @@ export default function DashboardPage() {
       const parsed = parseDxfToSlabGeometry(fileText, file.name);
 
       importSlabGeometry(parsed.slabGeometry);
-      window.sessionStorage.setItem(
-        importedProjectStorageKey,
-        JSON.stringify(parsed.slabGeometry)
-      );
+      await saveSlabGeometryProject(parsed.slabGeometry);
       setStatus("DXF loaded. Opening workspace...");
       router.push("/workspace");
     } catch (error) {

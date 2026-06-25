@@ -10,21 +10,32 @@ import {
 } from "react";
 
 import { mockMeshZones, mockSlabGeometry } from "@/data/mockStructureData";
+import { pointInPolygon } from "@/lib/geometry/clipping";
 import { compareBaseMeshOrientations } from "@/lib/geometry/mesh-sheet-layout";
 import type {
   BaseMeshSettings,
   BaseMeshSettingsUpdate,
+  CadTextEntity,
   ExportedReinforcementConfiguration,
   MeshZone,
   MeshZoneUpdate,
   Point,
   DwgUnderlay,
+  RawDeficitZone,
   SlabDesignArea,
   SlabDesignAreaPurpose,
   SlabGeometry
 } from "@/types/structure";
 
+const BASE_CAPACITY = 393;
+const rawDeficitPadding = 450;
+const minimumRawDeficitSize = 900;
+
 type DesignAreaDrawingMode = "polygon" | "rectangle";
+type StrapLayerAxis = "x" | "y";
+type RawDeficitPoint = Point & {
+  requiredAs: number;
+};
 
 type ReinforcementContextValue = {
   slabGeometry: SlabGeometry;
@@ -83,7 +94,11 @@ type ReinforcementContextValue = {
     layerName: string,
     visible: boolean
   ) => void;
+  setDxfUnderlayScale: (underlayId: string, scale: number) => void;
   translateDxfUnderlay: (underlayId: string, delta: Point) => void;
+  setStrapLayer: (axis: StrapLayerAxis, underlay: DwgUnderlay) => void;
+  deleteStrapLayer: (axis: StrapLayerAxis) => void;
+  generateRawDeficitZones: () => number;
   generateSlabFromVisibleLayers: () => boolean;
   activateBaseMeshOnWorkingSlab: (patch?: BaseMeshSettingsUpdate) => boolean;
   setActiveZoneId: (zoneId: string) => void;
@@ -110,17 +125,162 @@ function createDxfUnderlayId(fileName: string) {
   return `DXF-${fileName.replace(/[^a-z0-9]+/gi, "-")}-${Date.now().toString(36)}`;
 }
 
+function createStrapUnderlayId(axis: StrapLayerAxis, fileName: string) {
+  return `STRAP-${axis.toUpperCase()}-${fileName.replace(/[^a-z0-9]+/gi, "-")}-${Date.now().toString(36)}`;
+}
+
 function normalizeDxfUnderlay(underlay: DwgUnderlay): DwgUnderlay {
   return {
     ...underlay,
     id: underlay.id ?? createDxfUnderlayId(underlay.importedFileName ?? "reference"),
     offset: underlay.offset ?? { x: 0, y: 0 },
+    scale: underlay.scale && underlay.scale > 0 ? underlay.scale : 1,
     visible: underlay.visible ?? true,
     layers: underlay.layers?.map((layer) => ({
       ...layer,
       visible: layer.visible ?? true
     }))
   };
+}
+
+function dxfUnderlayScale(underlay: DwgUnderlay) {
+  return underlay.scale && underlay.scale > 0 ? underlay.scale : 1;
+}
+
+function dxfUnderlayTransformOrigin(underlay: DwgUnderlay): Point {
+  return underlay.bounds
+    ? {
+        x: (underlay.bounds.minX + underlay.bounds.maxX) / 2,
+        y: (underlay.bounds.minY + underlay.bounds.maxY) / 2
+      }
+    : { x: 0, y: 0 };
+}
+
+function transformDxfPoint(underlay: DwgUnderlay, point: Point): Point {
+  const offset = underlay.offset ?? { x: 0, y: 0 };
+  const origin = dxfUnderlayTransformOrigin(underlay);
+  const underlayScale = dxfUnderlayScale(underlay);
+
+  return {
+    x: offset.x + origin.x + (point.x - origin.x) * underlayScale,
+    y: offset.y + origin.y + (point.y - origin.y) * underlayScale
+  };
+}
+
+function parseRequiredSteelValue(text: string) {
+  if (text.includes("/")) {
+    return null;
+  }
+
+  const values =
+    text
+      .match(/-?\d+(?:[\.,]\d+)?/g)
+      ?.map((value) => Number(value.replace(",", ".")))
+      .filter((value) => Number.isFinite(value) && value > 0) ?? [];
+
+  if (values.length !== 1) {
+    return null;
+  }
+
+  const rawValue = values[0];
+
+  return rawValue < 100 ? rawValue * 100 : rawValue;
+}
+
+function collectRawDeficitPoints(
+  underlay: DwgUnderlay | undefined,
+  calculationBoundary: Point[]
+) {
+  if (!underlay || underlay.visible === false) {
+    return [];
+  }
+
+  const visibleLayers = new Set(
+    underlay.layers?.filter((layer) => layer.visible).map((layer) => layer.name) ??
+      []
+  );
+
+  return underlay.texts.reduce<RawDeficitPoint[]>((points, text: CadTextEntity) => {
+    if (visibleLayers.size > 0 && !visibleLayers.has(text.layer)) {
+      return points;
+    }
+
+    const requiredAs = parseRequiredSteelValue(text.text);
+
+    if (requiredAs === null || requiredAs <= BASE_CAPACITY) {
+      return points;
+    }
+
+    const transformedPoint = transformDxfPoint(underlay, text.position);
+
+    if (
+      calculationBoundary.length >= 3 &&
+      !pointInPolygon(transformedPoint, calculationBoundary)
+    ) {
+      return points;
+    }
+
+    points.push({
+      ...transformedPoint,
+      requiredAs
+    });
+    return points;
+  }, []);
+}
+
+function deficitClusterDistance(points: RawDeficitPoint[]) {
+  if (points.length < 2) {
+    return 2_500;
+  }
+
+  const minX = Math.min(...points.map((point) => point.x));
+  const maxX = Math.max(...points.map((point) => point.x));
+  const minY = Math.min(...points.map((point) => point.y));
+  const maxY = Math.max(...points.map((point) => point.y));
+  const diagonal = Math.hypot(maxX - minX, maxY - minY);
+
+  return Math.max(1_500, Math.min(5_000, diagonal / 35));
+}
+
+function clusterRawDeficitPoints(points: RawDeficitPoint[]): RawDeficitZone[] {
+  const clusterDistance = deficitClusterDistance(points);
+  const clusters: RawDeficitPoint[][] = [];
+
+  for (const point of points) {
+    const matchingCluster = clusters.find((cluster) =>
+      cluster.some(
+        (clusterPoint) =>
+          Math.hypot(clusterPoint.x - point.x, clusterPoint.y - point.y) <=
+          clusterDistance
+      )
+    );
+
+    if (matchingCluster) {
+      matchingCluster.push(point);
+    } else {
+      clusters.push([point]);
+    }
+  }
+
+  return clusters.map((cluster) => {
+    const minX = Math.min(...cluster.map((point) => point.x));
+    const maxX = Math.max(...cluster.map((point) => point.x));
+    const minY = Math.min(...cluster.map((point) => point.y));
+    const maxY = Math.max(...cluster.map((point) => point.y));
+    const width = Math.max(minimumRawDeficitSize, maxX - minX + rawDeficitPadding * 2);
+    const height = Math.max(
+      minimumRawDeficitSize,
+      maxY - minY + rawDeficitPadding * 2
+    );
+
+    return {
+      x: (minX + maxX) / 2 - width / 2,
+      y: (minY + maxY) / 2 - height / 2,
+      width,
+      height,
+      maxRequiredAs: Math.max(...cluster.map((point) => point.requiredAs))
+    };
+  });
 }
 
 function withRecommendedOrientation(
@@ -800,10 +960,22 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       const importedUnderlay = nextSlabGeometry.dwgUnderlay
         ? normalizeDxfUnderlay(nextSlabGeometry.dwgUnderlay)
         : undefined;
+      const strapLayerX = nextSlabGeometry.strapLayerX
+        ? normalizeDxfUnderlay(nextSlabGeometry.strapLayerX)
+        : undefined;
+      const strapLayerY = nextSlabGeometry.strapLayerY
+        ? normalizeDxfUnderlay(nextSlabGeometry.strapLayerY)
+        : undefined;
       const normalizedSlabGeometry = {
         ...nextSlabGeometry,
         dwgUnderlay: importedUnderlay,
-        dxfUnderlays: importedUnderlay ? [importedUnderlay] : []
+        dxfUnderlays: importedUnderlay
+          ? (nextSlabGeometry.dxfUnderlays ?? [importedUnderlay]).map(
+              normalizeDxfUnderlay
+            )
+          : [],
+        strapLayerX,
+        strapLayerY
       };
       const nextMainZone = createMainZoneForSlab(
         normalizedSlabGeometry,
@@ -864,7 +1036,15 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
         ...current,
         dxfUnderlays: (current.dxfUnderlays ?? []).map((underlay) =>
           underlay.id === underlayId ? { ...underlay, visible } : underlay
-        )
+        ),
+        strapLayerX:
+          current.strapLayerX?.id === underlayId
+            ? { ...current.strapLayerX, visible }
+            : current.strapLayerX,
+        strapLayerY:
+          current.strapLayerY?.id === underlayId
+            ? { ...current.strapLayerY, visible }
+            : current.strapLayerY
       }));
     },
     []
@@ -883,11 +1063,53 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
                 )
               }
             : underlay
-        )
+        ),
+        strapLayerX:
+          current.strapLayerX?.id === underlayId
+            ? {
+                ...current.strapLayerX,
+                layers: current.strapLayerX.layers?.map((layer) =>
+                  layer.name === layerName ? { ...layer, visible } : layer
+                )
+              }
+            : current.strapLayerX,
+        strapLayerY:
+          current.strapLayerY?.id === underlayId
+            ? {
+                ...current.strapLayerY,
+                layers: current.strapLayerY.layers?.map((layer) =>
+                  layer.name === layerName ? { ...layer, visible } : layer
+                )
+              }
+            : current.strapLayerY
       }));
     },
     []
   );
+
+  const setDxfUnderlayScale = useCallback((underlayId: string, scale: number) => {
+    const nextScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+
+    setSlabGeometry((current) => ({
+      ...current,
+      dxfUnderlays: (current.dxfUnderlays ?? []).map((underlay) =>
+        underlay.id === underlayId
+          ? {
+              ...underlay,
+              scale: nextScale
+            }
+          : underlay
+      ),
+      strapLayerX:
+        current.strapLayerX?.id === underlayId
+          ? { ...current.strapLayerX, scale: nextScale }
+          : current.strapLayerX,
+      strapLayerY:
+        current.strapLayerY?.id === underlayId
+          ? { ...current.strapLayerY, scale: nextScale }
+          : current.strapLayerY
+    }));
+  }, []);
 
   const translateDxfUnderlay = useCallback((underlayId: string, delta: Point) => {
     setSlabGeometry((current) => ({
@@ -902,9 +1124,76 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
               }
             }
           : underlay
-      )
+      ),
+      strapLayerX:
+        current.strapLayerX?.id === underlayId
+          ? {
+              ...current.strapLayerX,
+              offset: {
+                x: (current.strapLayerX.offset?.x ?? 0) + delta.x,
+                y: (current.strapLayerX.offset?.y ?? 0) + delta.y
+              }
+            }
+          : current.strapLayerX,
+      strapLayerY:
+        current.strapLayerY?.id === underlayId
+          ? {
+              ...current.strapLayerY,
+              offset: {
+                x: (current.strapLayerY.offset?.x ?? 0) + delta.x,
+                y: (current.strapLayerY.offset?.y ?? 0) + delta.y
+              }
+            }
+          : current.strapLayerY
     }));
   }, []);
+
+  const setStrapLayer = useCallback((axis: StrapLayerAxis, underlay: DwgUnderlay) => {
+    const nextUnderlay = normalizeDxfUnderlay({
+      ...underlay,
+      id:
+        underlay.id ??
+        createStrapUnderlayId(axis, underlay.importedFileName ?? "strap-analysis")
+    });
+
+    setSlabGeometry((current) => ({
+      ...current,
+      ...(axis === "x"
+        ? { strapLayerX: nextUnderlay }
+        : { strapLayerY: nextUnderlay })
+    }));
+    setActiveDxfUnderlayId(nextUnderlay.id ?? null);
+  }, []);
+
+  const deleteStrapLayer = useCallback((axis: StrapLayerAxis) => {
+    const deletedLayerId =
+      axis === "x" ? slabGeometry.strapLayerX?.id : slabGeometry.strapLayerY?.id;
+
+    setSlabGeometry((current) => ({
+        ...current,
+        ...(axis === "x"
+          ? { strapLayerX: undefined }
+          : { strapLayerY: undefined })
+    }));
+    setActiveDxfUnderlayId((current) =>
+      current === deletedLayerId ? null : current
+    );
+  }, [slabGeometry.strapLayerX?.id, slabGeometry.strapLayerY?.id]);
+
+  const generateRawDeficitZones = useCallback(() => {
+    const deficitPoints = [
+      ...collectRawDeficitPoints(slabGeometry.strapLayerX, slabGeometry.boundary),
+      ...collectRawDeficitPoints(slabGeometry.strapLayerY, slabGeometry.boundary)
+    ];
+    const rawDeficitZones = clusterRawDeficitPoints(deficitPoints);
+
+    setSlabGeometry((current) => ({
+      ...current,
+      rawDeficitZones
+    }));
+
+    return rawDeficitZones.length;
+  }, [slabGeometry.boundary, slabGeometry.strapLayerX, slabGeometry.strapLayerY]);
 
   const generateSlabFromVisibleLayers = useCallback(() => {
     const tracedBoundary =
@@ -1085,6 +1374,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       setCalculatedSlabVisible,
       deleteCalculatedSlab,
       deleteDxfUnderlay,
+      deleteStrapLayer,
       setSelectedDesignAreaId,
       setDesignAreaVisible,
       updateDesignAreaPurpose,
@@ -1101,12 +1391,15 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       addDxfUnderlay,
       activateBaseMeshOnWorkingSlab,
       deleteDxfUnderlayById,
+      generateRawDeficitZones,
       generateSlabFromVisibleLayers,
       importSlabGeometry,
       setActiveZoneId,
       setActiveDxfUnderlayId,
       setDxfUnderlayLayerVisible,
+      setDxfUnderlayScale,
       setDxfUnderlayVisible,
+      setStrapLayer,
       setUnderlayLayerVisible,
       translateDxfUnderlay,
       updateActiveMeshZone,
@@ -1142,6 +1435,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       setCalculatedSlabVisible,
       deleteCalculatedSlab,
       deleteDxfUnderlay,
+      deleteStrapLayer,
       setSelectedDesignAreaId,
       setDesignAreaVisible,
       updateDesignAreaPurpose,
@@ -1158,12 +1452,15 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       addDxfUnderlay,
       activateBaseMeshOnWorkingSlab,
       deleteDxfUnderlayById,
+      generateRawDeficitZones,
       generateSlabFromVisibleLayers,
       importSlabGeometry,
       setUnderlayLayerVisible,
       setActiveDxfUnderlayId,
       setDxfUnderlayLayerVisible,
+      setDxfUnderlayScale,
       setDxfUnderlayVisible,
+      setStrapLayer,
       translateDxfUnderlay,
       updateActiveMeshZone,
       updateActiveMeshZoneParameters,

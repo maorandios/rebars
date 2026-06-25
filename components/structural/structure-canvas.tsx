@@ -14,10 +14,12 @@ import type {
   CadCircleEntity,
   CadLineEntity,
   CadTextEntity,
+  DwgUnderlay,
   MeshSheet,
   MeshZone,
   Point,
   Polygon,
+  RawDeficitZone,
   SlabDesignArea,
   SlabGeometry,
   SlabOpening,
@@ -58,6 +60,50 @@ type ZoneDraft = {
 
 function distance(a: Point, b: Point) {
   return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function dxfUnderlayScale(underlay: DwgUnderlay) {
+  return underlay.scale && underlay.scale > 0 ? underlay.scale : 1;
+}
+
+function dxfUnderlayTransformOrigin(underlay: DwgUnderlay): Point {
+  return underlay.bounds
+    ? {
+        x: (underlay.bounds.minX + underlay.bounds.maxX) / 2,
+        y: (underlay.bounds.minY + underlay.bounds.maxY) / 2
+      }
+    : { x: 0, y: 0 };
+}
+
+function transformDxfPoint(underlay: DwgUnderlay, point: Point): Point {
+  const offset = underlay.offset ?? { x: 0, y: 0 };
+  const origin = dxfUnderlayTransformOrigin(underlay);
+  const underlayScale = dxfUnderlayScale(underlay);
+
+  return {
+    x: offset.x + origin.x + (point.x - origin.x) * underlayScale,
+    y: offset.y + origin.y + (point.y - origin.y) * underlayScale
+  };
+}
+
+function transformedDxfBounds(underlay: DwgUnderlay) {
+  if (!underlay.bounds) {
+    return null;
+  }
+
+  const corners = [
+    { x: underlay.bounds.minX, y: underlay.bounds.minY },
+    { x: underlay.bounds.maxX, y: underlay.bounds.minY },
+    { x: underlay.bounds.maxX, y: underlay.bounds.maxY },
+    { x: underlay.bounds.minX, y: underlay.bounds.maxY }
+  ].map((point) => transformDxfPoint(underlay, point));
+
+  return {
+    maxX: Math.max(...corners.map((point) => point.x)),
+    maxY: Math.max(...corners.map((point) => point.y)),
+    minX: Math.min(...corners.map((point) => point.x)),
+    minY: Math.min(...corners.map((point) => point.y))
+  };
 }
 
 function screenPx(value: number, scale: number) {
@@ -204,11 +250,12 @@ function drawText(
 function drawCadLine(
   context: CanvasRenderingContext2D,
   line: CadLineEntity,
-  scale: number
+  scale: number,
+  colorOverride?: string
 ) {
   drawPolylinePath(context, line.points);
   setDraftStroke(context, scale, {
-    color: line.color ?? "#9b9b9b",
+    color: colorOverride ?? line.color ?? "#9b9b9b",
     dash: line.layer.includes("GRID") ? [8, 8] : undefined,
     widthPx: line.lineWeightPx ?? 1
   });
@@ -219,12 +266,13 @@ function drawCadLine(
 function drawCadText(
   context: CanvasRenderingContext2D,
   text: CadTextEntity,
-  scale: number
+  scale: number,
+  colorOverride?: string
 ) {
   drawText(context, text.text, text.position.x, text.position.y, scale, {
     align: text.align,
     baseline: text.baseline,
-    color: text.color ?? canvasMutedText,
+    color: colorOverride ?? text.color ?? canvasMutedText,
     height: text.heightPx ?? cadTextHeight.small,
     rotation: text.rotation,
   });
@@ -233,12 +281,13 @@ function drawCadText(
 function drawCadCircle(
   context: CanvasRenderingContext2D,
   circle: CadCircleEntity,
-  scale: number
+  scale: number,
+  colorOverride?: string
 ) {
   context.beginPath();
   context.arc(circle.center.x, circle.center.y, circle.radius, 0, Math.PI * 2);
   setDraftStroke(context, scale, {
-    color: circle.color ?? "#71717a",
+    color: colorOverride ?? circle.color ?? "#71717a",
     widthPx: circle.lineWeightPx ?? 0.8
   });
   context.stroke();
@@ -248,7 +297,8 @@ function drawCadCircle(
 function drawCadArc(
   context: CanvasRenderingContext2D,
   arc: CadArcEntity,
-  scale: number
+  scale: number,
+  colorOverride?: string
 ) {
   context.beginPath();
   context.arc(
@@ -259,7 +309,7 @@ function drawCadArc(
     arc.endAngle
   );
   setDraftStroke(context, scale, {
-    color: arc.color ?? "#71717a",
+    color: colorOverride ?? arc.color ?? "#71717a",
     widthPx: arc.lineWeightPx ?? 0.8
   });
   context.stroke();
@@ -364,6 +414,96 @@ function drawDesignAreas(
   }
 }
 
+function drawRawDeficitZone(
+  context: CanvasRenderingContext2D,
+  zone: RawDeficitZone,
+  scale: number
+) {
+  context.save();
+  context.beginPath();
+  context.rect(zone.x, zone.y, zone.width, zone.height);
+  context.fillStyle = "#ef4444";
+  context.globalAlpha = 0.18;
+  context.fill();
+  context.globalAlpha = 1;
+  setDraftStroke(context, scale, {
+    color: "#f87171",
+    dash: [14, 8],
+    widthPx: 2
+  });
+  context.stroke();
+  resetDraftStroke(context);
+  drawText(
+    context,
+    `Max Needed: ${Math.round(zone.maxRequiredAs)} mm2/m`,
+    zone.x + zone.width / 2,
+    zone.y + zone.height / 2,
+    scale,
+    {
+      color: "#fecaca",
+      height: cadTextHeight.small
+    }
+  );
+  context.restore();
+}
+
+function drawRawDeficitZones(
+  context: CanvasRenderingContext2D,
+  slabGeometry: SlabGeometry,
+  scale: number
+) {
+  for (const zone of slabGeometry.rawDeficitZones ?? []) {
+    drawRawDeficitZone(context, zone, scale);
+  }
+}
+
+function drawDxfUnderlayReference(
+  context: CanvasRenderingContext2D,
+  underlay: DwgUnderlay,
+  scale: number,
+  colorOverride?: string
+) {
+  if (underlay.visible === false) {
+    return;
+  }
+
+  const offset = underlay.offset ?? { x: 0, y: 0 };
+  const origin = dxfUnderlayTransformOrigin(underlay);
+  const underlayScale = dxfUnderlayScale(underlay);
+  const effectiveScale = scale * underlayScale;
+  const visibleLayers = visibleUnderlayLayers(underlay);
+
+  context.save();
+  context.translate(offset.x, offset.y);
+  context.translate(origin.x, origin.y);
+  context.scale(underlayScale, underlayScale);
+  context.translate(-origin.x, -origin.y);
+  for (const line of underlay.lines) {
+    if (isLayerVisible(visibleLayers, line.layer)) {
+      drawCadLine(context, line, effectiveScale, colorOverride);
+    }
+  }
+
+  for (const text of underlay.texts) {
+    if (isLayerVisible(visibleLayers, text.layer)) {
+      drawCadText(context, text, effectiveScale, colorOverride);
+    }
+  }
+
+  for (const circle of underlay.circles ?? []) {
+    if (isLayerVisible(visibleLayers, circle.layer)) {
+      drawCadCircle(context, circle, effectiveScale, colorOverride);
+    }
+  }
+
+  for (const arc of underlay.arcs ?? []) {
+    if (isLayerVisible(visibleLayers, arc.layer)) {
+      drawCadArc(context, arc, effectiveScale, colorOverride);
+    }
+  }
+  context.restore();
+}
+
 function drawDwgUnderlay(
   context: CanvasRenderingContext2D,
   slabGeometry: SlabGeometry,
@@ -374,7 +514,12 @@ function drawDwgUnderlay(
     (slabGeometry.dwgUnderlay?.importedFileName ? [slabGeometry.dwgUnderlay] : []);
   const calculatedUnderlay = slabGeometry.dwgUnderlay;
 
-  if (!dxfReferences.length && !calculatedUnderlay) {
+  if (
+    !dxfReferences.length &&
+    !calculatedUnderlay &&
+    !slabGeometry.strapLayerX &&
+    !slabGeometry.strapLayerY
+  ) {
     return;
   }
 
@@ -382,41 +527,18 @@ function drawDwgUnderlay(
   context.globalAlpha = 0.38;
 
   for (const underlay of dxfReferences) {
-    if (underlay.visible === false) {
-      continue;
-    }
-
-    const offset = underlay.offset ?? { x: 0, y: 0 };
-    const visibleLayers = visibleUnderlayLayers(underlay);
-
-    context.save();
-    context.translate(offset.x, offset.y);
-    for (const line of underlay.lines) {
-      if (isLayerVisible(visibleLayers, line.layer)) {
-        drawCadLine(context, line, scale);
-      }
-    }
-
-    for (const text of underlay.texts) {
-      if (isLayerVisible(visibleLayers, text.layer)) {
-        drawCadText(context, text, scale);
-      }
-    }
-
-    for (const circle of underlay.circles ?? []) {
-      if (isLayerVisible(visibleLayers, circle.layer)) {
-        drawCadCircle(context, circle, scale);
-      }
-    }
-
-    for (const arc of underlay.arcs ?? []) {
-      if (isLayerVisible(visibleLayers, arc.layer)) {
-        drawCadArc(context, arc, scale);
-      }
-    }
-    context.restore();
+    drawDxfUnderlayReference(context, underlay, scale);
   }
 
+  context.globalAlpha = 0.7;
+  if (slabGeometry.strapLayerX) {
+    drawDxfUnderlayReference(context, slabGeometry.strapLayerX, scale, "#e879f9");
+  }
+  if (slabGeometry.strapLayerY) {
+    drawDxfUnderlayReference(context, slabGeometry.strapLayerY, scale, "#fb923c");
+  }
+
+  context.globalAlpha = 0.38;
   if (calculatedUnderlay) {
     const visibleLayers = visibleUnderlayLayers(calculatedUnderlay);
     for (const line of calculatedUnderlay.lines) {
@@ -1143,6 +1265,7 @@ export function StructureCanvas() {
             drawSlabGeometry(context, slabGeometry, scaleRef.current);
           }
           drawDesignAreas(context, slabGeometry, scaleRef.current);
+          drawRawDeficitZones(context, slabGeometry, scaleRef.current);
           const editingDesignArea = (slabGeometry.designAreas ?? []).find(
             (area) => area.id === editingDesignAreaId
           );
@@ -1190,6 +1313,7 @@ export function StructureCanvas() {
         );
       }
       drawDesignAreas(context, slabGeometry, scaleRef.current);
+      drawRawDeficitZones(context, slabGeometry, scaleRef.current);
       const editingDesignArea = (slabGeometry.designAreas ?? []).find(
         (area) => area.id === editingDesignAreaId
       );
@@ -1323,20 +1447,20 @@ export function StructureCanvas() {
         (slabGeometry.dwgUnderlay?.importedFileName
           ? [slabGeometry.dwgUnderlay]
           : []);
+      const snapReferences = [
+        ...references,
+        slabGeometry.strapLayerX,
+        slabGeometry.strapLayerY
+      ].filter((reference): reference is DwgUnderlay => Boolean(reference));
       let closest: Point | null = null;
       let closestDistance = Number.POSITIVE_INFINITY;
 
-      for (const reference of references) {
+      for (const reference of snapReferences) {
         if (reference.visible === false) {
           continue;
         }
-        const offset = reference.offset ?? { x: 0, y: 0 };
-
         for (const vertex of reference.dxfVertices ?? []) {
-          const offsetVertex = {
-            x: vertex.x + offset.x,
-            y: vertex.y + offset.y
-          };
+          const offsetVertex = transformDxfPoint(reference, vertex);
           const nextDistance = distance(worldPoint, offsetVertex);
 
           if (nextDistance < closestDistance) {
@@ -1350,20 +1474,23 @@ export function StructureCanvas() {
     };
 
     const activeDxfUnderlayAt = (worldPoint: Point) => {
-      const underlay = (slabGeometry.dxfUnderlays ?? []).find(
-        (reference) => reference.id === activeDxfUnderlayId
-      );
+      const underlay = [
+        ...(slabGeometry.dxfUnderlays ?? []),
+        slabGeometry.strapLayerX,
+        slabGeometry.strapLayerY
+      ].find((reference) => reference?.id === activeDxfUnderlayId);
 
       if (!underlay?.bounds || underlay.visible === false) {
         return null;
       }
 
-      const offset = underlay.offset ?? { x: 0, y: 0 };
+      const bounds = transformedDxfBounds(underlay);
 
-      return worldPoint.x >= underlay.bounds.minX + offset.x &&
-        worldPoint.x <= underlay.bounds.maxX + offset.x &&
-        worldPoint.y >= underlay.bounds.minY + offset.y &&
-        worldPoint.y <= underlay.bounds.maxY + offset.y
+      return bounds &&
+        worldPoint.x >= bounds.minX &&
+        worldPoint.x <= bounds.maxX &&
+        worldPoint.y >= bounds.minY &&
+        worldPoint.y <= bounds.maxY
         ? underlay
         : null;
     };
@@ -1808,6 +1935,9 @@ export function StructureCanvas() {
     slabGeometry.dxfUnderlays,
     slabGeometry.dwgUnderlay,
     slabGeometry.dwgUnderlay?.dxfVertices,
+    slabGeometry.rawDeficitZones,
+    slabGeometry.strapLayerX,
+    slabGeometry.strapLayerY,
     renderCanvas,
     setActiveDxfUnderlayId,
     translateDxfUnderlay,

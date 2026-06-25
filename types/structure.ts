@@ -72,6 +72,7 @@ export type DwgUnderlay = {
   importedFileName?: string;
   offset?: Point;
   reviewOnly?: boolean;
+  scale?: number;
   dxfVertices?: Point[];
   layers?: DwgUnderlayLayer[];
   lines: CadLineEntity[];
@@ -107,6 +108,14 @@ export type SlabDesignArea = {
   meshZoneId?: string;
 };
 
+export type RawDeficitZone = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  maxRequiredAs: number;
+};
+
 export type StructuralElementType = "perimeter_wall" | "core_wall" | "column";
 
 export type StructuralElement = {
@@ -123,6 +132,9 @@ export type SlabGeometry = {
   meshInteriorBoundary?: Polygon;
   dwgUnderlay?: DwgUnderlay;
   dxfUnderlays?: DwgUnderlay[];
+  strapLayerX?: DwgUnderlay;
+  strapLayerY?: DwgUnderlay;
+  rawDeficitZones?: RawDeficitZone[];
   designAreas?: SlabDesignArea[];
   openings: SlabOpening[];
   structuralElements: StructuralElement[];

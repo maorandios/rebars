@@ -9,9 +9,12 @@ import {
 } from "@/components/structural/base-mesh-panel";
 import { StructureCanvas } from "@/components/structural/structure-canvas";
 import { useReinforcement } from "@/context/reinforcement-context";
-import type { SlabGeometry } from "@/types/structure";
-
-const importedProjectStorageKey = "rebars.importedSlabGeometry";
+import {
+  loadLegacySessionProject,
+  loadSlabGeometryProject,
+  removeSlabGeometryProject,
+  saveSlabGeometryProject
+} from "@/lib/project-storage";
 
 export default function WorkspacePage() {
   const { slabGeometry, importSlabGeometry } = useReinforcement();
@@ -25,17 +28,26 @@ export default function WorkspacePage() {
       return;
     }
 
-    const storedProject = window.sessionStorage.getItem(importedProjectStorageKey);
+    let isCancelled = false;
 
-    if (!storedProject) {
-      return;
+    async function restoreProject() {
+      try {
+        const storedProject =
+          (await loadSlabGeometryProject()) ?? loadLegacySessionProject();
+
+        if (!isCancelled && storedProject) {
+          importSlabGeometry(storedProject);
+        }
+      } catch {
+        await removeSlabGeometryProject();
+      }
     }
 
-    try {
-      importSlabGeometry(JSON.parse(storedProject) as SlabGeometry);
-    } catch {
-      window.sessionStorage.removeItem(importedProjectStorageKey);
-    }
+    void restoreProject();
+
+    return () => {
+      isCancelled = true;
+    };
   }, [importSlabGeometry, slabGeometry.dwgUnderlay?.importedFileName]);
 
   useEffect(() => {
@@ -43,10 +55,9 @@ export default function WorkspacePage() {
       return;
     }
 
-    window.sessionStorage.setItem(
-      importedProjectStorageKey,
-      JSON.stringify(slabGeometry)
-    );
+    void saveSlabGeometryProject(slabGeometry).catch((error) => {
+      console.warn("Project autosave failed", error);
+    });
   }, [slabGeometry]);
 
   const handleDockChange = (dock: DockSection) => {
@@ -59,6 +70,13 @@ export default function WorkspacePage() {
           : { type: "mesh" }
     );
   };
+
+  const dockItems: { id: DockSection; label: string }[] = [
+    { id: "dxf", label: "DXF" },
+    { id: "slab", label: "SLAB" },
+    { id: "mesh", label: "MESH" },
+    { id: "analysis", label: "אנליזה" }
+  ];
 
   return (
     <main
@@ -75,7 +93,7 @@ export default function WorkspacePage() {
         <section className="relative h-full min-w-0 flex-1 pb-20">
           <StructureCanvas />
         </section>
-        {activeDock !== "dxf" ? (
+        {activeDock !== "dxf" && activeDock !== "analysis" ? (
           <MeshInspectorPanel
             activeDock={activeDock}
             inspectorContext={inspectorContext}
@@ -85,19 +103,19 @@ export default function WorkspacePage() {
         ) : null}
       </div>
       <nav className="pointer-events-none fixed inset-x-0 bottom-4 z-20 flex justify-center">
-        <div className="pointer-events-auto grid grid-cols-3 overflow-hidden rounded-2xl border border-primary/20 bg-card/95 p-1 shadow-2xl shadow-black/40 backdrop-blur-xl">
-          {(["dxf", "slab", "mesh"] as DockSection[]).map((dock) => (
+        <div className="pointer-events-auto grid grid-cols-4 overflow-hidden rounded-2xl border border-primary/20 bg-card/95 p-1 shadow-2xl shadow-black/40 backdrop-blur-xl">
+          {dockItems.map((dock) => (
             <button
-              key={dock}
+              key={dock.id}
               className={`min-w-28 rounded-xl px-5 py-3 text-sm font-semibold uppercase tracking-[0.16em] transition ${
-                activeDock === dock
+                activeDock === dock.id
                   ? "bg-primary text-primary-foreground shadow-lg shadow-primary/20"
                   : "text-muted-foreground hover:bg-muted hover:text-foreground"
               }`}
               type="button"
-              onClick={() => handleDockChange(dock)}
+              onClick={() => handleDockChange(dock.id)}
             >
-              {dock}
+              {dock.label}
             </button>
           ))}
         </div>
