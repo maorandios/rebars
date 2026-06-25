@@ -683,6 +683,19 @@ export function MeshZonesPanel({
                 Data rows: {slabGeometry.strapNumericalData?.length ?? 0} |
                 Overloaded elements:{" "}
                 {slabGeometry.strapOverloadedElements?.length ?? 0}
+                {" "}|
+                Extra mesh zones: {slabGeometry.strapExtraMeshZones?.length ?? 0}
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                Strips:{" "}
+                {slabGeometry.strapExtraMeshZones?.filter(
+                  (zone) => zone.kind === "strip"
+                ).length ?? 0}
+                {" "}|
+                Patches:{" "}
+                {slabGeometry.strapExtraMeshZones?.filter(
+                  (zone) => zone.kind === "patch"
+                ).length ?? 0}
               </div>
               {slabGeometry.strapAnalysisDebug ? (
                 <div className="mt-2 rounded-xl border border-fuchsia-300/20 bg-background/40 p-2 text-xs leading-5 text-muted-foreground">
@@ -708,6 +721,12 @@ export function MeshZonesPanel({
                   <br />
                   CSV rows over 393:{" "}
                   {slabGeometry.strapAnalysisDebug.overloadedCsvRows ?? 0}
+                  <br />
+                  Contour points over 393:{" "}
+                  {slabGeometry.strapAnalysisDebug.contourDeficitPoints ?? 0}
+                  <br />
+                  Extra mesh zones:{" "}
+                  {slabGeometry.strapAnalysisDebug.extraMeshZones ?? 0}
                   <br />
                   Inferred ID offset:{" "}
                   {slabGeometry.strapAnalysisDebug.inferredIdOffset ?? "-"}

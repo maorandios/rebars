@@ -21,12 +21,15 @@ import type {
   MeshZone,
   MeshZoneUpdate,
   Point,
+  Polygon,
   DwgUnderlay,
   RawDeficitZone,
   SlabDesignArea,
   SlabDesignAreaPurpose,
   SlabGeometry,
+  SlabOpening,
   StrapAnalysisDebug,
+  StrapExtraMeshZone,
   StrapNumericalData,
   StrapOverloadedElement
 } from "@/types/structure";
@@ -34,6 +37,21 @@ import type {
 const BASE_CAPACITY = 393;
 const rawDeficitPadding = 450;
 const minimumRawDeficitSize = 900;
+const extraZoneExpansion = 650;
+const extraZoneMergeGap = 650;
+const extraZoneSnap = 250;
+const minimumExtraZoneSize = 1_500;
+const maximumExtraPatchLength = 18_000;
+const maximumExtraPatchDepth = 9_000;
+const maximumExtraStripLength = 12_000;
+const minimumExtraStripLength = 4_000;
+const maximumExtraStripWidth = 3_500;
+const maximumStripSourceWidth = 2_200;
+const contourDeficitInfluence = 650;
+const contourAttachGap = 1_000;
+const contourEdgeTolerance = 2_200;
+const contourEdgeBandLength = 5_000;
+const contourEdgeBandDepth = 1_800;
 
 type DesignAreaDrawingMode = "polygon" | "rectangle";
 type StrapLayerAxis = "x" | "y";
@@ -210,6 +228,222 @@ function polygonAreaAbs(polygon: Point[]) {
 
       return area + point.x * next.y - next.x * point.y;
     }, 0) / 2
+  );
+}
+
+function boundsFromPolygon(polygon: Point[]) {
+  return {
+    maxX: Math.max(...polygon.map((point) => point.x)),
+    maxY: Math.max(...polygon.map((point) => point.y)),
+    minX: Math.min(...polygon.map((point) => point.x)),
+    minY: Math.min(...polygon.map((point) => point.y))
+  };
+}
+
+function boundsOverlapOrNear(
+  first: ReturnType<typeof boundsFromPolygon>,
+  second: ReturnType<typeof boundsFromPolygon>,
+  gap: number
+) {
+  return !(
+    first.maxX + gap < second.minX ||
+    second.maxX + gap < first.minX ||
+    first.maxY + gap < second.minY ||
+    second.maxY + gap < first.minY
+  );
+}
+
+function mergeBounds(
+  first: ReturnType<typeof boundsFromPolygon>,
+  second: ReturnType<typeof boundsFromPolygon>
+) {
+  return {
+    maxX: Math.max(first.maxX, second.maxX),
+    maxY: Math.max(first.maxY, second.maxY),
+    minX: Math.min(first.minX, second.minX),
+    minY: Math.min(first.minY, second.minY)
+  };
+}
+
+function boundsWidth(bounds: ReturnType<typeof boundsFromPolygon>) {
+  return bounds.maxX - bounds.minX;
+}
+
+function boundsHeight(bounds: ReturnType<typeof boundsFromPolygon>) {
+  return bounds.maxY - bounds.minY;
+}
+
+function boundsCanBecomeExtraMeshCandidate(
+  bounds: ReturnType<typeof boundsFromPolygon>
+) {
+  const width = boundsWidth(bounds);
+  const height = boundsHeight(bounds);
+
+  return (
+    Math.max(width, height) <= maximumExtraPatchLength &&
+    Math.min(width, height) <= maximumExtraPatchDepth
+  );
+}
+
+function snapDown(value: number, increment: number) {
+  return Math.floor(value / increment) * increment;
+}
+
+function snapUp(value: number, increment: number) {
+  return Math.ceil(value / increment) * increment;
+}
+
+function rectanglePolygon(bounds: ReturnType<typeof boundsFromPolygon>) {
+  return [
+    { x: bounds.minX, y: bounds.minY },
+    { x: bounds.maxX, y: bounds.minY },
+    { x: bounds.maxX, y: bounds.maxY },
+    { x: bounds.minX, y: bounds.maxY }
+  ];
+}
+
+function pointInAnyOpening(point: Point, openings: SlabOpening[]) {
+  return openings.some((opening) => pointInPolygon(point, opening.polygon));
+}
+
+function clampBoundsToBounds(
+  bounds: ReturnType<typeof boundsFromPolygon>,
+  clamp: ReturnType<typeof boundsFromPolygon>
+) {
+  return {
+    maxX: Math.min(bounds.maxX, clamp.maxX),
+    maxY: Math.min(bounds.maxY, clamp.maxY),
+    minX: Math.max(bounds.minX, clamp.minX),
+    minY: Math.max(bounds.minY, clamp.minY)
+  };
+}
+
+function pointDistanceToBounds(
+  point: Point,
+  bounds: ReturnType<typeof boundsFromPolygon>
+) {
+  const dx = Math.max(bounds.minX - point.x, 0, point.x - bounds.maxX);
+  const dy = Math.max(bounds.minY - point.y, 0, point.y - bounds.maxY);
+
+  return Math.hypot(dx, dy);
+}
+
+function pointDistanceToSegment(point: Point, start: Point, end: Point) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSquared = dx * dx + dy * dy;
+
+  if (lengthSquared === 0) {
+    return Math.hypot(point.x - start.x, point.y - start.y);
+  }
+
+  const t = Math.max(
+    0,
+    Math.min(
+      1,
+      ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared
+    )
+  );
+  const projection = {
+    x: start.x + t * dx,
+    y: start.y + t * dy
+  };
+
+  return Math.hypot(point.x - projection.x, point.y - projection.y);
+}
+
+function pointDistanceToPolygon(point: Point, polygon: Polygon) {
+  if (polygon.length < 2) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return polygon.reduce((minimumDistance, start, index) => {
+    const end = polygon[(index + 1) % polygon.length];
+
+    return Math.min(minimumDistance, pointDistanceToSegment(point, start, end));
+  }, Number.POSITIVE_INFINITY);
+}
+
+function nearestPolygonSegment(point: Point, polygon: Polygon) {
+  if (polygon.length < 2) {
+    return null;
+  }
+
+  return polygon.reduce<{
+    distance: number;
+    end: Point;
+    start: Point;
+  } | null>((nearest, start, index) => {
+    const end = polygon[(index + 1) % polygon.length];
+    const distance = pointDistanceToSegment(point, start, end);
+
+    if (!nearest || distance < nearest.distance) {
+      return { distance, end, start };
+    }
+
+    return nearest;
+  }, null);
+}
+
+function contourEvidenceBounds(
+  point: RawDeficitPoint,
+  slabBoundary: Polygon
+) {
+  const nearestSegment = nearestPolygonSegment(point, slabBoundary);
+
+  if (nearestSegment && nearestSegment.distance <= contourEdgeTolerance) {
+    const dx = Math.abs(nearestSegment.end.x - nearestSegment.start.x);
+    const dy = Math.abs(nearestSegment.end.y - nearestSegment.start.y);
+    const isHorizontalEdge = dx >= dy;
+
+    return {
+      maxX:
+        point.x +
+        (isHorizontalEdge ? contourEdgeBandLength / 2 : contourEdgeBandDepth / 2),
+      maxY:
+        point.y +
+        (isHorizontalEdge ? contourEdgeBandDepth / 2 : contourEdgeBandLength / 2),
+      minX:
+        point.x -
+        (isHorizontalEdge ? contourEdgeBandLength / 2 : contourEdgeBandDepth / 2),
+      minY:
+        point.y -
+        (isHorizontalEdge ? contourEdgeBandDepth / 2 : contourEdgeBandLength / 2)
+    };
+  }
+
+  return {
+    maxX: point.x + contourDeficitInfluence,
+    maxY: point.y + contourDeficitInfluence,
+    minX: point.x - contourDeficitInfluence,
+    minY: point.y - contourDeficitInfluence
+  };
+}
+
+function pointInExpandedBounds(
+  point: Point,
+  bounds: ReturnType<typeof boundsFromPolygon>,
+  padding: number
+) {
+  return (
+    point.x >= bounds.minX - padding &&
+    point.x <= bounds.maxX + padding &&
+    point.y >= bounds.minY - padding &&
+    point.y <= bounds.maxY + padding
+  );
+}
+
+function pointInOrNearPolygon(point: Point, polygon: Polygon, tolerance: number) {
+  if (polygon.length < 3) {
+    return true;
+  }
+
+  const bounds = boundsFromPolygon(polygon);
+
+  return (
+    pointInPolygon(point, polygon) ||
+    pointInExpandedBounds(point, bounds, tolerance) &&
+      pointDistanceToPolygon(point, polygon) <= tolerance
   );
 }
 
@@ -605,6 +839,256 @@ function collectOverloadedElementsFromCells(
   }, []);
 }
 
+function createExtraMeshZonesFromOverloads(
+  overloadedElements: StrapOverloadedElement[],
+  contourDeficitPoints: RawDeficitPoint[],
+  slabBoundary: Polygon,
+  openings: SlabOpening[]
+): StrapExtraMeshZone[] {
+  type ExtraMeshEvidence = {
+    bounds: ReturnType<typeof boundsFromPolygon>;
+    center: Point;
+    contourPointCount: number;
+    overloadedElementCount: number;
+    maxRequiredAs: number;
+  };
+
+  const slabBounds = slabBoundary.length >= 3 ? boundsFromPolygon(slabBoundary) : null;
+  const evidenceItems: ExtraMeshEvidence[] = [];
+
+  const addEvidenceItem = (
+    bounds: ReturnType<typeof boundsFromPolygon>,
+    center: Point,
+    maxRequiredAs: number,
+    evidence: "cell" | "contour"
+  ) => {
+    const isInsideRelevantSlabArea =
+      evidence === "contour"
+        ? pointInOrNearPolygon(center, slabBoundary, contourEdgeTolerance)
+        : pointInPolygon(center, slabBoundary);
+
+    if (
+      slabBoundary.length >= 3 &&
+      (!isInsideRelevantSlabArea || pointInAnyOpening(center, openings))
+    ) {
+      return;
+    }
+
+    evidenceItems.push({
+      bounds,
+      center,
+      contourPointCount: evidence === "contour" ? 1 : 0,
+      overloadedElementCount: evidence === "cell" ? 1 : 0,
+      maxRequiredAs
+    });
+  };
+
+  for (const element of overloadedElements) {
+    const center = polygonCenter(element.polygon);
+    addEvidenceItem(
+      boundsFromPolygon(element.polygon),
+      center,
+      element.maxRequiredAs,
+      "cell"
+    );
+  }
+
+  for (const point of contourDeficitPoints) {
+    addEvidenceItem(
+      contourEvidenceBounds(point, slabBoundary),
+      point,
+      point.requiredAs,
+      "contour"
+    );
+  }
+
+  const visited = new Set<number>();
+  const islandClusters: ExtraMeshEvidence[] = [];
+
+  for (let index = 0; index < evidenceItems.length; index += 1) {
+    if (visited.has(index)) {
+      continue;
+    }
+
+    const stack = [index];
+    const component: ExtraMeshEvidence[] = [];
+    visited.add(index);
+
+    while (stack.length > 0) {
+      const currentIndex = stack.pop();
+
+      if (currentIndex === undefined) {
+        continue;
+      }
+
+      const current = evidenceItems[currentIndex];
+      component.push(current);
+
+      for (let otherIndex = 0; otherIndex < evidenceItems.length; otherIndex += 1) {
+        if (visited.has(otherIndex)) {
+          continue;
+        }
+
+        const other = evidenceItems[otherIndex];
+        const centersAreClose =
+          Math.hypot(
+            current.center.x - other.center.x,
+            current.center.y - other.center.y
+          ) <= contourAttachGap;
+        const boundsAreConnected =
+          boundsOverlapOrNear(current.bounds, other.bounds, extraZoneMergeGap) ||
+          pointDistanceToBounds(current.center, other.bounds) <= extraZoneMergeGap ||
+          pointDistanceToBounds(other.center, current.bounds) <= extraZoneMergeGap;
+
+        if (centersAreClose || boundsAreConnected) {
+          visited.add(otherIndex);
+          stack.push(otherIndex);
+        }
+      }
+    }
+
+    const cluster = component.slice(1).reduce<ExtraMeshEvidence>(
+      (mergedCluster, item) => ({
+        bounds: mergeBounds(mergedCluster.bounds, item.bounds),
+        center: {
+          x: (mergedCluster.center.x + item.center.x) / 2,
+          y: (mergedCluster.center.y + item.center.y) / 2
+        },
+        contourPointCount:
+          mergedCluster.contourPointCount + item.contourPointCount,
+        overloadedElementCount:
+          mergedCluster.overloadedElementCount + item.overloadedElementCount,
+        maxRequiredAs: Math.max(mergedCluster.maxRequiredAs, item.maxRequiredAs)
+      }),
+      component[0]
+    );
+
+    islandClusters.push(cluster);
+  }
+
+  const mergeFinalIslandClusters = (clusters: ExtraMeshEvidence[]) => {
+    const merged = [...clusters];
+    let didMerge = true;
+
+    while (didMerge) {
+      didMerge = false;
+
+      for (let index = 0; index < merged.length; index += 1) {
+        for (let otherIndex = index + 1; otherIndex < merged.length; otherIndex += 1) {
+          const combinedBounds = mergeBounds(
+            merged[index].bounds,
+            merged[otherIndex].bounds
+          );
+
+          if (
+            boundsOverlapOrNear(
+              merged[index].bounds,
+              merged[otherIndex].bounds,
+              extraZoneMergeGap
+            ) &&
+            boundsCanBecomeExtraMeshCandidate(combinedBounds)
+          ) {
+            merged[index] = {
+              bounds: combinedBounds,
+              center: {
+                x: (merged[index].center.x + merged[otherIndex].center.x) / 2,
+                y: (merged[index].center.y + merged[otherIndex].center.y) / 2
+              },
+              contourPointCount:
+                merged[index].contourPointCount +
+                merged[otherIndex].contourPointCount,
+              overloadedElementCount:
+                merged[index].overloadedElementCount +
+                merged[otherIndex].overloadedElementCount,
+              maxRequiredAs: Math.max(
+                merged[index].maxRequiredAs,
+                merged[otherIndex].maxRequiredAs
+              )
+            };
+            merged.splice(otherIndex, 1);
+            didMerge = true;
+            break;
+          }
+        }
+
+        if (didMerge) {
+          break;
+        }
+      }
+    }
+
+    return merged;
+  };
+
+  return mergeFinalIslandClusters(islandClusters).map((cluster, index) => {
+    const centerX = (cluster.bounds.minX + cluster.bounds.maxX) / 2;
+    const centerY = (cluster.bounds.minY + cluster.bounds.maxY) / 2;
+    const rawWidth = boundsWidth(cluster.bounds);
+    const rawHeight = boundsHeight(cluster.bounds);
+    const aspectRatio =
+      Math.max(rawWidth, rawHeight) / Math.max(1, Math.min(rawWidth, rawHeight));
+    const minorDimension = Math.min(rawWidth, rawHeight);
+    const shouldCreateStrip =
+      aspectRatio >= 1.75 &&
+      Math.max(rawWidth, rawHeight) >= minimumExtraStripLength * 0.65 &&
+      Math.max(rawWidth, rawHeight) <= maximumExtraStripLength &&
+      minorDimension <= maximumStripSourceWidth;
+    const orientation =
+      shouldCreateStrip && rawWidth >= rawHeight ? "horizontal" : "vertical";
+    const width = shouldCreateStrip
+      ? orientation === "horizontal"
+        ? Math.min(
+            maximumExtraStripLength,
+            Math.max(minimumExtraStripLength, rawWidth + extraZoneExpansion * 2)
+          )
+        : Math.min(
+            maximumExtraStripWidth,
+            Math.max(minimumExtraZoneSize, rawWidth + extraZoneExpansion * 2)
+          )
+      : Math.min(
+          rawWidth >= rawHeight ? maximumExtraPatchLength : maximumExtraPatchDepth,
+          Math.max(minimumExtraZoneSize, rawWidth + extraZoneExpansion * 2)
+        );
+    const height = shouldCreateStrip
+      ? orientation === "horizontal"
+        ? Math.min(
+            maximumExtraStripWidth,
+            Math.max(minimumExtraZoneSize, rawHeight + extraZoneExpansion * 2)
+          )
+        : Math.min(
+            maximumExtraStripLength,
+            Math.max(minimumExtraStripLength, rawHeight + extraZoneExpansion * 2)
+          )
+      : Math.min(
+          rawHeight >= rawWidth ? maximumExtraPatchLength : maximumExtraPatchDepth,
+          Math.max(minimumExtraZoneSize, rawHeight + extraZoneExpansion * 2)
+        );
+    const expandedBounds = {
+      maxX: snapUp(centerX + width / 2, extraZoneSnap),
+      maxY: snapUp(centerY + height / 2, extraZoneSnap),
+      minX: snapDown(centerX - width / 2, extraZoneSnap),
+      minY: snapDown(centerY - height / 2, extraZoneSnap)
+    };
+    const finalBounds = slabBounds
+      ? clampBoundsToBounds(expandedBounds, slabBounds)
+      : expandedBounds;
+
+    return {
+      id: `STRAP-EXTRA-ZONE-${index + 1}`,
+      label: shouldCreateStrip
+        ? `Extra Mesh Strip ${index + 1}`
+        : `Extra Mesh Patch ${index + 1}`,
+      kind: shouldCreateStrip ? "strip" : "patch",
+      orientation: shouldCreateStrip ? orientation : undefined,
+      polygon: rectanglePolygon(finalBounds),
+      contourPointCount: cluster.contourPointCount,
+      overloadedElementCount: cluster.overloadedElementCount,
+      maxRequiredAs: cluster.maxRequiredAs,
+      recommendedExtraAs: Math.max(0, cluster.maxRequiredAs - BASE_CAPACITY)
+    };
+  });
+}
+
 function collectOverloadedElementsFromLayer(
   axis: StrapLayerAxis,
   underlay: DwgUnderlay | undefined,
@@ -687,7 +1171,11 @@ function collectRawDeficitPoints(
 
     if (
       calculationBoundary.length >= 3 &&
-      !pointInPolygon(transformedPoint, calculationBoundary)
+      !pointInOrNearPolygon(
+        transformedPoint,
+        calculationBoundary,
+        contourEdgeTolerance
+      )
     ) {
       return points;
     }
@@ -1656,6 +2144,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setSlabGeometry((current) => ({
       ...current,
       strapNumericalData: data,
+      strapExtraMeshZones: [],
       strapOverloadedElements: [],
       strapAnalysisDebug: undefined
     }));
@@ -1727,6 +2216,17 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
         : shouldUseSequentialMapping
           ? sequentialElements
           : [...polygonOverloadedElements, ...directLabelFallbackElements];
+    const contourDeficitPoints = [
+      ...collectRawDeficitPoints(slabGeometry.strapLayerX, slabGeometry.boundary),
+      ...collectRawDeficitPoints(slabGeometry.strapLayerY, slabGeometry.boundary)
+    ];
+    const strapExtraMeshZones =
+      createExtraMeshZonesFromOverloads(
+        strapOverloadedElements,
+        contourDeficitPoints,
+        slabGeometry.boundary,
+        slabGeometry.openings
+      );
     const maxCsvRequiredAs = Math.max(
       0,
       ...(slabGeometry.strapNumericalData ?? []).map((row) => row.maxRequiredAs)
@@ -1743,6 +2243,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
         (slabGeometry.strapLayerX?.closedPolylines?.length ?? 0) +
         (slabGeometry.strapLayerY?.closedPolylines?.length ?? 0),
       overloadedElements: strapOverloadedElements.length,
+      contourDeficitPoints: contourDeficitPoints.length,
+      extraMeshZones: strapExtraMeshZones.length,
       elementCellCandidates: elementCells.length,
       sampleCsvElementIds: [...numericalDataByElement.keys()].slice(0, 8),
       sampleDxfElementIds: [...dxfIds].slice(0, 8),
@@ -1761,6 +2263,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
 
     setSlabGeometry((current) => ({
       ...current,
+      strapExtraMeshZones,
       strapOverloadedElements,
       strapAnalysisDebug
     }));
@@ -1770,7 +2273,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     slabGeometry.boundary,
     slabGeometry.strapLayerX,
     slabGeometry.strapLayerY,
-    slabGeometry.strapNumericalData
+    slabGeometry.strapNumericalData,
+    slabGeometry.openings
   ]);
 
   const generateRawDeficitZones = useCallback(() => {

@@ -133,8 +133,22 @@ export type StrapOverloadedElement = {
   maxRequiredAs: number;
 };
 
+export type StrapExtraMeshZone = {
+  id: string;
+  label: string;
+  kind: "patch" | "strip";
+  orientation?: "horizontal" | "vertical";
+  polygon: Polygon;
+  contourPointCount: number;
+  overloadedElementCount: number;
+  maxRequiredAs: number;
+  recommendedExtraAs: number;
+};
+
 export type StrapAnalysisDebug = {
+  contourDeficitPoints?: number;
   elementCellCandidates?: number;
+  extraMeshZones?: number;
   elementLabels: number;
   matchedElementLabels: number;
   polygonCandidates: number;
@@ -169,6 +183,7 @@ export type SlabGeometry = {
   strapLayerY?: DwgUnderlay;
   strapNumericalData?: StrapNumericalData[];
   strapOverloadedElements?: StrapOverloadedElement[];
+  strapExtraMeshZones?: StrapExtraMeshZone[];
   strapAnalysisDebug?: StrapAnalysisDebug;
   rawDeficitZones?: RawDeficitZone[];
   designAreas?: SlabDesignArea[];

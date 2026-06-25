@@ -23,6 +23,7 @@ import type {
   SlabDesignArea,
   SlabGeometry,
   SlabOpening,
+  StrapExtraMeshZone,
   StrapOverloadedElement,
   StructuralElement
 } from "@/types/structure";
@@ -463,30 +464,52 @@ function drawStrapOverloadedElement(
   element: StrapOverloadedElement,
   scale: number
 ) {
-  const center = polygonCenter(element.polygon);
   const color = element.axis === "x" ? "#e879f9" : "#fb923c";
 
   context.save();
   drawPolygonPath(context, element.polygon);
   context.fillStyle = color;
-  context.globalAlpha = 0.28;
+  context.globalAlpha = 0.16;
   context.fill();
   context.globalAlpha = 1;
   setDraftStroke(context, scale, {
     color,
-    widthPx: 2.4
+    widthPx: 0.8
+  });
+  context.stroke();
+  resetDraftStroke(context);
+  context.restore();
+}
+
+function drawStrapExtraMeshZone(
+  context: CanvasRenderingContext2D,
+  zone: StrapExtraMeshZone,
+  scale: number
+) {
+  const center = polygonCenter(zone.polygon);
+  const isStrip = zone.kind === "strip";
+
+  context.save();
+  drawPolygonPath(context, zone.polygon);
+  context.fillStyle = isStrip ? "#1d4ed8" : "#dc2626";
+  context.globalAlpha = isStrip ? 0.3 : 0.24;
+  context.fill();
+  context.globalAlpha = 1;
+  setDraftStroke(context, scale, {
+    color: isStrip ? "#93c5fd" : "#fecaca",
+    widthPx: isStrip ? 4.2 : 3.2
   });
   context.stroke();
   resetDraftStroke(context);
   drawText(
     context,
-    `El ${element.elementId}\nMax ${Math.round(element.maxRequiredAs)} mm2/m`,
+    `${zone.label}\n${zone.orientation ?? "local"} | Extra As ${Math.round(zone.recommendedExtraAs)} mm2/m\n${zone.overloadedElementCount} cells / ${zone.contourPointCount} pts`,
     center.x,
     center.y,
     scale,
     {
       color: "#ffffff",
-      height: cadTextHeight.small * 0.75
+      height: cadTextHeight.small
     }
   );
   context.restore();
@@ -499,6 +522,16 @@ function drawStrapOverloadedElements(
 ) {
   for (const element of slabGeometry.strapOverloadedElements ?? []) {
     drawStrapOverloadedElement(context, element, scale);
+  }
+}
+
+function drawStrapExtraMeshZones(
+  context: CanvasRenderingContext2D,
+  slabGeometry: SlabGeometry,
+  scale: number
+) {
+  for (const zone of slabGeometry.strapExtraMeshZones ?? []) {
+    drawStrapExtraMeshZone(context, zone, scale);
   }
 }
 
@@ -1312,6 +1345,7 @@ export function StructureCanvas() {
           drawDesignAreas(context, slabGeometry, scaleRef.current);
           drawRawDeficitZones(context, slabGeometry, scaleRef.current);
           drawStrapOverloadedElements(context, slabGeometry, scaleRef.current);
+          drawStrapExtraMeshZones(context, slabGeometry, scaleRef.current);
           const editingDesignArea = (slabGeometry.designAreas ?? []).find(
             (area) => area.id === editingDesignAreaId
           );
@@ -1361,6 +1395,7 @@ export function StructureCanvas() {
       drawDesignAreas(context, slabGeometry, scaleRef.current);
       drawRawDeficitZones(context, slabGeometry, scaleRef.current);
       drawStrapOverloadedElements(context, slabGeometry, scaleRef.current);
+      drawStrapExtraMeshZones(context, slabGeometry, scaleRef.current);
       const editingDesignArea = (slabGeometry.designAreas ?? []).find(
         (area) => area.id === editingDesignAreaId
       );
@@ -1985,6 +2020,7 @@ export function StructureCanvas() {
     slabGeometry.rawDeficitZones,
     slabGeometry.strapLayerX,
     slabGeometry.strapLayerY,
+    slabGeometry.strapExtraMeshZones,
     slabGeometry.strapOverloadedElements,
     renderCanvas,
     setActiveDxfUnderlayId,
