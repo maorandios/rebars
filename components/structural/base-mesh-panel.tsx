@@ -1,6 +1,8 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Papa from "papaparse";
+import * as XLSX from "xlsx";
 import {
   CheckCircle2,
   Circle,
@@ -32,7 +34,11 @@ import { mockBaseMeshSettings } from "@/data/mockStructureData";
 import { parseDxfToSlabGeometry } from "@/lib/dxf-parser";
 import { compareBaseMeshOrientations } from "@/lib/geometry/mesh-sheet-layout";
 import { removeSlabGeometryProject } from "@/lib/project-storage";
-import type { BaseMeshSettings, BaseMeshSettingsUpdate } from "@/types/structure";
+import type {
+  BaseMeshSettings,
+  BaseMeshSettingsUpdate,
+  StrapNumericalData
+} from "@/types/structure";
 
 const diameterOptions: BaseMeshSettings["diameter"][] = [8, 10, 12];
 const spacingOptions: BaseMeshSettings["spacing"][] = [150, 200, 250];
@@ -92,6 +98,114 @@ function squareMeters(value: number) {
   return (value / 1_000_000).toFixed(1);
 }
 
+function parseNumberToken(value: string) {
+  const parsed = Number(value.replace(",", "."));
+
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function cm2PerMeterToMm2PerMeter(value: number) {
+  return value * 100;
+}
+
+function normalizeTableRows(rawRows: unknown[][]) {
+  return rawRows.map((row) =>
+    row
+      .flatMap((cell) => String(cell ?? "").trim().split(/\s+/))
+      .filter(Boolean)
+  );
+}
+
+function parseStrapNumericalRows(rawRows: unknown[][]): StrapNumericalData[] {
+  const rows = normalizeTableRows(rawRows);
+  const lines = rows.map((row) => row.join(" ").trim());
+  const headerIndex = lines.findIndex((line) => {
+    const normalized = line.toLowerCase();
+
+    return (
+      /\bel\.?\b/.test(normalized) &&
+      /\bcomb\b/.test(normalized) &&
+      normalized.includes("asx") &&
+      normalized.includes("asy")
+    );
+  });
+
+  if (headerIndex < 0) {
+    throw new Error("Could not find STRAP numerical table header: El.");
+  }
+
+  const headerCells = rows[headerIndex].map((cell) => cell.toLowerCase());
+  const elementIndex = headerCells.findIndex((cell) => cell === "el.");
+  const combIndex = headerCells.findIndex((cell) => cell === "comb");
+  const valueStartIndex =
+    elementIndex >= 0 && combIndex >= 0 ? Math.max(elementIndex, combIndex) + 1 : 2;
+  const byElement = new Map<string, StrapNumericalData>();
+
+  for (const row of rows.slice(headerIndex + 1)) {
+    const elementToken = row[elementIndex];
+    const elementValue = elementToken ? parseNumberToken(elementToken) : null;
+    const values = row
+      .slice(valueStartIndex)
+      .map(parseNumberToken)
+      .filter((value): value is number => value !== null);
+
+    if (elementValue === null || values.length < 4) {
+      continue;
+    }
+
+    const elementId = String(Math.trunc(elementValue));
+    const [asxTop, asyTop, asxBottom, asyBottom] = values
+      .slice(0, 4)
+      .map(cm2PerMeterToMm2PerMeter);
+    const existing = byElement.get(elementId) ?? {
+      elementId,
+      maxAsxTop: 0,
+      maxAsyTop: 0,
+      maxAsxBottom: 0,
+      maxAsyBottom: 0,
+      maxRequiredAs: 0
+    };
+    const next = {
+      elementId,
+      maxAsxTop: Math.max(existing.maxAsxTop, asxTop),
+      maxAsyTop: Math.max(existing.maxAsyTop, asyTop),
+      maxAsxBottom: Math.max(existing.maxAsxBottom, asxBottom),
+      maxAsyBottom: Math.max(existing.maxAsyBottom, asyBottom),
+      maxRequiredAs: 0
+    };
+
+    next.maxRequiredAs = Math.max(
+      next.maxAsxTop,
+      next.maxAsyTop,
+      next.maxAsxBottom,
+      next.maxAsyBottom
+    );
+    byElement.set(elementId, next);
+  }
+
+  return [...byElement.values()];
+}
+
+function parseStrapNumericalText(rawText: string) {
+  const parsed = Papa.parse<string[]>(rawText, {
+    skipEmptyLines: true
+  });
+
+  return parseStrapNumericalRows(parsed.data);
+}
+
+function parseStrapNumericalWorkbook(buffer: ArrayBuffer) {
+  const workbook = XLSX.read(buffer, { type: "array" });
+  const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json<unknown[]>(worksheet, {
+    blankrows: false,
+    header: 1,
+    raw: true
+  });
+
+  return parseStrapNumericalRows(rows);
+}
+
 export function MeshZonesPanel({
   activeDock,
   inspectorContext,
@@ -111,6 +225,8 @@ export function MeshZonesPanel({
     setDxfUnderlayVisible,
     setStrapLayer,
     deleteStrapLayer,
+    setStrapNumericalData,
+    runThreeWayAnalysis,
     generateRawDeficitZones,
     translateDxfUnderlay,
     setSelectedDesignAreaId,
@@ -125,6 +241,9 @@ export function MeshZonesPanel({
   const [rawStrapDxfY, setRawStrapDxfY] = useState<string | null>(null);
   const [strapFileNameX, setStrapFileNameX] = useState<string | null>(null);
   const [strapFileNameY, setStrapFileNameY] = useState<string | null>(null);
+  const [strapNumericalFileName, setStrapNumericalFileName] = useState<
+    string | null
+  >(null);
   const [strapUploadStatus, setStrapUploadStatus] = useState<string | null>(null);
   const underlay = slabGeometry.dwgUnderlay;
   const hasActiveSlabBoundary = slabGeometry.hasActiveSlabBoundary ?? true;
@@ -195,6 +314,31 @@ export function MeshZonesPanel({
     } else {
       setRawStrapDxfY(rawDxf);
       setStrapFileNameY(file.name);
+    }
+  }
+
+  async function handleStrapNumericalFile(file: File | undefined) {
+    if (!file) {
+      return;
+    }
+
+    try {
+      const isWorkbook = /\.(xlsx|xls)$/i.test(file.name);
+      const parsedData = isWorkbook
+        ? parseStrapNumericalWorkbook(await file.arrayBuffer())
+        : parseStrapNumericalText(await file.text());
+
+      setStrapNumericalData(parsedData);
+      setStrapNumericalFileName(file.name);
+      setStrapUploadStatus(
+        `Loaded ${parsedData.length} STRAP numerical element rows.`
+      );
+    } catch (error) {
+      setStrapUploadStatus(
+        error instanceof Error
+          ? error.message
+          : "Failed to parse STRAP numerical data."
+      );
     }
   }
 
@@ -507,6 +651,86 @@ export function MeshZonesPanel({
               <div className="mt-2 text-xs text-muted-foreground">
                 Current zones: {slabGeometry.rawDeficitZones?.length ?? 0}
               </div>
+            </div>
+            <div className="rounded-2xl border border-fuchsia-300/25 bg-fuchsia-300/10 p-4">
+              <div className="text-sm font-semibold text-foreground">
+                3-Way Data Cross-Reference
+              </div>
+              <p className="mt-2 text-xs leading-5 text-fuchsia-100/80">
+                Match STRAP CSV element maxima to physical DXF element polygons
+                and tint only overloaded elements.
+              </p>
+              <Button
+                className="mt-3 w-full"
+                disabled={
+                  (!slabGeometry.strapLayerX && !slabGeometry.strapLayerY) ||
+                  !slabGeometry.strapNumericalData?.length
+                }
+                type="button"
+                variant="secondary"
+                onClick={() => {
+                  const overloadedCount = runThreeWayAnalysis();
+                  setStrapUploadStatus(
+                    `Matched ${overloadedCount} overloaded STRAP element${
+                      overloadedCount === 1 ? "" : "s"
+                    }.`
+                  );
+                }}
+              >
+                בצע הצלבה הנדסית משולבת
+              </Button>
+              <div className="mt-2 text-xs text-muted-foreground">
+                Data rows: {slabGeometry.strapNumericalData?.length ?? 0} |
+                Overloaded elements:{" "}
+                {slabGeometry.strapOverloadedElements?.length ?? 0}
+              </div>
+              {slabGeometry.strapAnalysisDebug ? (
+                <div className="mt-2 rounded-xl border border-fuchsia-300/20 bg-background/40 p-2 text-xs leading-5 text-muted-foreground">
+                  DXF element labels:{" "}
+                  {slabGeometry.strapAnalysisDebug.elementLabels}
+                  <br />
+                  Matched labels:{" "}
+                  {slabGeometry.strapAnalysisDebug.matchedElementLabels}
+                  <br />
+                  Matched unique IDs:{" "}
+                  {slabGeometry.strapAnalysisDebug.matchedUniqueIds ?? 0}
+                  <br />
+                  Matching mode:{" "}
+                  {slabGeometry.strapAnalysisDebug.matchingMode ?? "-"}
+                  <br />
+                  Element grid cells:{" "}
+                  {slabGeometry.strapAnalysisDebug.elementCellCandidates ?? 0}
+                  <br />
+                  Max CSV As:{" "}
+                  {Math.round(
+                    slabGeometry.strapAnalysisDebug.maxCsvRequiredAs ?? 0
+                  )}
+                  <br />
+                  CSV rows over 393:{" "}
+                  {slabGeometry.strapAnalysisDebug.overloadedCsvRows ?? 0}
+                  <br />
+                  Inferred ID offset:{" "}
+                  {slabGeometry.strapAnalysisDebug.inferredIdOffset ?? "-"}
+                  <br />
+                  Closed polygon candidates:{" "}
+                  {slabGeometry.strapAnalysisDebug.polygonCandidates}
+                  <br />
+                  CSV IDs:{" "}
+                  {slabGeometry.strapAnalysisDebug.sampleCsvElementIds?.join(
+                    ", "
+                  ) ?? "-"}
+                  <br />
+                  DXF IDs:{" "}
+                  {slabGeometry.strapAnalysisDebug.sampleDxfElementIds?.join(
+                    ", "
+                  ) ?? "-"}
+                  <br />
+                  Common IDs:{" "}
+                  {slabGeometry.strapAnalysisDebug.sampleMatchedElementIds?.join(
+                    ", "
+                  ) ?? "-"}
+                </div>
+              ) : null}
             </div>
             {strapLayers.map(({ axis, color, label, layer }) => {
               const layerId = layer?.id ?? `strap-${axis}`;
@@ -871,7 +1095,7 @@ export function MeshZonesPanel({
             </div>
           </div>
 
-          <div className="grid gap-4 p-5 md:grid-cols-2">
+          <div className="grid gap-4 p-5 md:grid-cols-3">
             <label className="flex min-h-44 cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed border-fuchsia-300/40 bg-fuchsia-300/10 p-5 text-center transition hover:border-fuchsia-300 hover:bg-fuchsia-300/15">
               <FileStack className="h-8 w-8 text-fuchsia-300" />
               <span className="mt-3 text-sm font-semibold text-foreground">
@@ -909,6 +1133,25 @@ export function MeshZonesPanel({
                 }}
               />
             </label>
+
+            <label className="flex min-h-44 cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed border-cyan-300/40 bg-cyan-300/10 p-5 text-center transition hover:border-cyan-300 hover:bg-cyan-300/15">
+              <FileStack className="h-8 w-8 text-cyan-300" />
+              <span className="mt-3 text-sm font-semibold text-foreground">
+                טען קובץ נתוני מאמצים גולמי (Excel/CSV)
+              </span>
+              <span className="mt-2 max-w-full truncate text-xs text-muted-foreground">
+                {strapNumericalFileName ?? "Choose CSV/text export"}
+              </span>
+              <Input
+                accept=".csv,.txt,.xls,.xlsx"
+                className="hidden"
+                type="file"
+                onChange={(event) => {
+                  void handleStrapNumericalFile(event.target.files?.[0]);
+                  event.target.value = "";
+                }}
+              />
+            </label>
           </div>
 
           <div className="flex items-center justify-between border-t bg-background/50 p-5">
@@ -924,7 +1167,7 @@ export function MeshZonesPanel({
                 Cancel
               </Button>
               <Button
-                disabled={!rawStrapDxfX && !rawStrapDxfY}
+                disabled={!rawStrapDxfX && !rawStrapDxfY && !strapNumericalFileName}
                 type="button"
                 onClick={loadStrapFilesToCanvas}
               >

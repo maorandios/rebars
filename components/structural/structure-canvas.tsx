@@ -23,6 +23,7 @@ import type {
   SlabDesignArea,
   SlabGeometry,
   SlabOpening,
+  StrapOverloadedElement,
   StructuralElement
 } from "@/types/structure";
 
@@ -454,6 +455,50 @@ function drawRawDeficitZones(
 ) {
   for (const zone of slabGeometry.rawDeficitZones ?? []) {
     drawRawDeficitZone(context, zone, scale);
+  }
+}
+
+function drawStrapOverloadedElement(
+  context: CanvasRenderingContext2D,
+  element: StrapOverloadedElement,
+  scale: number
+) {
+  const center = polygonCenter(element.polygon);
+  const color = element.axis === "x" ? "#e879f9" : "#fb923c";
+
+  context.save();
+  drawPolygonPath(context, element.polygon);
+  context.fillStyle = color;
+  context.globalAlpha = 0.28;
+  context.fill();
+  context.globalAlpha = 1;
+  setDraftStroke(context, scale, {
+    color,
+    widthPx: 2.4
+  });
+  context.stroke();
+  resetDraftStroke(context);
+  drawText(
+    context,
+    `El ${element.elementId}\nMax ${Math.round(element.maxRequiredAs)} mm2/m`,
+    center.x,
+    center.y,
+    scale,
+    {
+      color: "#ffffff",
+      height: cadTextHeight.small * 0.75
+    }
+  );
+  context.restore();
+}
+
+function drawStrapOverloadedElements(
+  context: CanvasRenderingContext2D,
+  slabGeometry: SlabGeometry,
+  scale: number
+) {
+  for (const element of slabGeometry.strapOverloadedElements ?? []) {
+    drawStrapOverloadedElement(context, element, scale);
   }
 }
 
@@ -1266,6 +1311,7 @@ export function StructureCanvas() {
           }
           drawDesignAreas(context, slabGeometry, scaleRef.current);
           drawRawDeficitZones(context, slabGeometry, scaleRef.current);
+          drawStrapOverloadedElements(context, slabGeometry, scaleRef.current);
           const editingDesignArea = (slabGeometry.designAreas ?? []).find(
             (area) => area.id === editingDesignAreaId
           );
@@ -1314,6 +1360,7 @@ export function StructureCanvas() {
       }
       drawDesignAreas(context, slabGeometry, scaleRef.current);
       drawRawDeficitZones(context, slabGeometry, scaleRef.current);
+      drawStrapOverloadedElements(context, slabGeometry, scaleRef.current);
       const editingDesignArea = (slabGeometry.designAreas ?? []).find(
         (area) => area.id === editingDesignAreaId
       );
@@ -1938,6 +1985,7 @@ export function StructureCanvas() {
     slabGeometry.rawDeficitZones,
     slabGeometry.strapLayerX,
     slabGeometry.strapLayerY,
+    slabGeometry.strapOverloadedElements,
     renderCanvas,
     setActiveDxfUnderlayId,
     translateDxfUnderlay,

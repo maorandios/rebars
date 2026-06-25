@@ -116,6 +116,39 @@ export type RawDeficitZone = {
   maxRequiredAs: number;
 };
 
+export type StrapNumericalData = {
+  elementId: string;
+  maxAsxTop: number;
+  maxAsyTop: number;
+  maxAsxBottom: number;
+  maxAsyBottom: number;
+  maxRequiredAs: number;
+};
+
+export type StrapOverloadedElement = {
+  id: string;
+  axis: "x" | "y";
+  elementId: string;
+  polygon: Polygon;
+  maxRequiredAs: number;
+};
+
+export type StrapAnalysisDebug = {
+  elementCellCandidates?: number;
+  elementLabels: number;
+  matchedElementLabels: number;
+  polygonCandidates: number;
+  overloadedElements: number;
+  sampleCsvElementIds?: string[];
+  sampleDxfElementIds?: string[];
+  sampleMatchedElementIds?: string[];
+  inferredIdOffset?: number;
+  matchingMode?: "direct-or-offset" | "elements-grid" | "sequential";
+  matchedUniqueIds?: number;
+  maxCsvRequiredAs?: number;
+  overloadedCsvRows?: number;
+};
+
 export type StructuralElementType = "perimeter_wall" | "core_wall" | "column";
 
 export type StructuralElement = {
@@ -134,6 +167,9 @@ export type SlabGeometry = {
   dxfUnderlays?: DwgUnderlay[];
   strapLayerX?: DwgUnderlay;
   strapLayerY?: DwgUnderlay;
+  strapNumericalData?: StrapNumericalData[];
+  strapOverloadedElements?: StrapOverloadedElement[];
+  strapAnalysisDebug?: StrapAnalysisDebug;
   rawDeficitZones?: RawDeficitZone[];
   designAreas?: SlabDesignArea[];
   openings: SlabOpening[];

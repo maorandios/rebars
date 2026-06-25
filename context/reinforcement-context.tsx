@@ -15,6 +15,7 @@ import { compareBaseMeshOrientations } from "@/lib/geometry/mesh-sheet-layout";
 import type {
   BaseMeshSettings,
   BaseMeshSettingsUpdate,
+  CadLineEntity,
   CadTextEntity,
   ExportedReinforcementConfiguration,
   MeshZone,
@@ -24,7 +25,10 @@ import type {
   RawDeficitZone,
   SlabDesignArea,
   SlabDesignAreaPurpose,
-  SlabGeometry
+  SlabGeometry,
+  StrapAnalysisDebug,
+  StrapNumericalData,
+  StrapOverloadedElement
 } from "@/types/structure";
 
 const BASE_CAPACITY = 393;
@@ -35,6 +39,22 @@ type DesignAreaDrawingMode = "polygon" | "rectangle";
 type StrapLayerAxis = "x" | "y";
 type RawDeficitPoint = Point & {
   requiredAs: number;
+};
+type StrapElementLabel = {
+  axis: StrapLayerAxis;
+  elementId: string;
+  point: Point;
+  underlay: DwgUnderlay;
+};
+type StrapIdResolver = {
+  offset: number | null;
+  resolve: (dxfElementId: string) => StrapNumericalData | undefined;
+  resolveElementId: (dxfElementId: string) => string | null;
+};
+type StrapElementCell = {
+  axis: StrapLayerAxis;
+  index: number;
+  polygon: Point[];
 };
 
 type ReinforcementContextValue = {
@@ -98,6 +118,8 @@ type ReinforcementContextValue = {
   translateDxfUnderlay: (underlayId: string, delta: Point) => void;
   setStrapLayer: (axis: StrapLayerAxis, underlay: DwgUnderlay) => void;
   deleteStrapLayer: (axis: StrapLayerAxis) => void;
+  setStrapNumericalData: (data: StrapNumericalData[]) => void;
+  runThreeWayAnalysis: () => number;
   generateRawDeficitZones: () => number;
   generateSlabFromVisibleLayers: () => boolean;
   activateBaseMeshOnWorkingSlab: (patch?: BaseMeshSettingsUpdate) => boolean;
@@ -167,6 +189,87 @@ function transformDxfPoint(underlay: DwgUnderlay, point: Point): Point {
   };
 }
 
+function transformDxfPolygon(underlay: DwgUnderlay, polygon: Point[]) {
+  return polygon.map((point) => transformDxfPoint(underlay, point));
+}
+
+function polygonCenter(polygon: Point[]): Point {
+  return polygon.reduce(
+    (sum, point, _, points) => ({
+      x: sum.x + point.x / points.length,
+      y: sum.y + point.y / points.length
+    }),
+    { x: 0, y: 0 }
+  );
+}
+
+function polygonAreaAbs(polygon: Point[]) {
+  return Math.abs(
+    polygon.reduce((area, point, index) => {
+      const next = polygon[(index + 1) % polygon.length];
+
+      return area + point.x * next.y - next.x * point.y;
+    }, 0) / 2
+  );
+}
+
+function normalizedElementId(text: string) {
+  const trimmed = text.trim();
+
+  return /^\d+$/.test(trimmed) ? String(Number(trimmed)) : null;
+}
+
+function numericElementIds(ids: Iterable<string>) {
+  return [...ids]
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id))
+    .toSorted((a, b) => a - b);
+}
+
+function createStrapIdResolver(
+  numericalDataByElement: Map<string, StrapNumericalData>,
+  dxfElementIds: Iterable<string>
+): StrapIdResolver {
+  const csvIds = numericElementIds(numericalDataByElement.keys());
+  const dxfIds = numericElementIds(dxfElementIds);
+  const offset =
+    csvIds.length > 0 && dxfIds.length > 0 ? csvIds[0] - dxfIds[0] : null;
+
+  return {
+    offset,
+    resolve: (dxfElementId: string) => {
+      const direct = numericalDataByElement.get(dxfElementId);
+
+      if (direct) {
+        return direct;
+      }
+
+      const numericDxfId = Number(dxfElementId);
+
+      if (offset === null || !Number.isFinite(numericDxfId)) {
+        return undefined;
+      }
+
+      return numericalDataByElement.get(String(numericDxfId + offset));
+    },
+    resolveElementId: (dxfElementId: string) => {
+      if (numericalDataByElement.has(dxfElementId)) {
+        return dxfElementId;
+      }
+
+      const numericDxfId = Number(dxfElementId);
+
+      if (offset === null || !Number.isFinite(numericDxfId)) {
+        return null;
+      }
+
+      const mappedId = String(numericDxfId + offset);
+
+      return numericalDataByElement.has(mappedId) ? mappedId : null;
+    }
+  };
+}
+
 function parseRequiredSteelValue(text: string) {
   if (text.includes("/")) {
     return null;
@@ -185,6 +288,375 @@ function parseRequiredSteelValue(text: string) {
   const rawValue = values[0];
 
   return rawValue < 100 ? rawValue * 100 : rawValue;
+}
+
+function findElementIdInsidePolygon(underlay: DwgUnderlay, polygon: Point[]) {
+  const center = polygonCenter(polygon);
+  const candidates = underlay.texts
+    .map((text) => ({
+      elementId: normalizedElementId(text.text),
+      point: transformDxfPoint(underlay, text.position)
+    }))
+    .filter(
+      (
+        item
+      ): item is {
+        elementId: string;
+        point: Point;
+      } => Boolean(item.elementId) && pointInPolygon(item.point, polygon)
+    )
+    .toSorted(
+      (a, b) =>
+        Math.hypot(a.point.x - center.x, a.point.y - center.y) -
+        Math.hypot(b.point.x - center.x, b.point.y - center.y)
+    );
+
+  return candidates[0]?.elementId ?? null;
+}
+
+function rectangleAroundPoint(center: Point, width: number, height: number) {
+  return [
+    { x: center.x - width / 2, y: center.y - height / 2 },
+    { x: center.x + width / 2, y: center.y - height / 2 },
+    { x: center.x + width / 2, y: center.y + height / 2 },
+    { x: center.x - width / 2, y: center.y + height / 2 }
+  ];
+}
+
+function roundedCoordinate(value: number) {
+  return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+function linePoints(line: CadLineEntity) {
+  if (line.points.length < 2) {
+    return null;
+  }
+
+  return {
+    end: line.points[line.points.length - 1],
+    start: line.points[0]
+  };
+}
+
+function isHorizontalLine(line: CadLineEntity) {
+  const points = linePoints(line);
+
+  return points ? Math.abs(points.start.y - points.end.y) < 0.00001 : false;
+}
+
+function isVerticalLine(line: CadLineEntity) {
+  const points = linePoints(line);
+
+  return points ? Math.abs(points.start.x - points.end.x) < 0.00001 : false;
+}
+
+function lineCoversHorizontalSpan(
+  line: CadLineEntity,
+  y: number,
+  x1: number,
+  x2: number
+) {
+  const points = linePoints(line);
+
+  if (!points || !isHorizontalLine(line)) {
+    return false;
+  }
+
+  const mid = (x1 + x2) / 2;
+  const minX = Math.min(points.start.x, points.end.x);
+  const maxX = Math.max(points.start.x, points.end.x);
+
+  return Math.abs(points.start.y - y) < 0.00001 && mid >= minX && mid <= maxX;
+}
+
+function lineCoversVerticalSpan(
+  line: CadLineEntity,
+  x: number,
+  y1: number,
+  y2: number
+) {
+  const points = linePoints(line);
+
+  if (!points || !isVerticalLine(line)) {
+    return false;
+  }
+
+  const mid = (y1 + y2) / 2;
+  const minY = Math.min(points.start.y, points.end.y);
+  const maxY = Math.max(points.start.y, points.end.y);
+
+  return Math.abs(points.start.x - x) < 0.00001 && mid >= minY && mid <= maxY;
+}
+
+function reconstructStrapElementCells(
+  axis: StrapLayerAxis,
+  underlay: DwgUnderlay | undefined
+): StrapElementCell[] {
+  if (!underlay || underlay.visible === false) {
+    return [];
+  }
+
+  const elementLines = underlay.lines.filter((line) => line.layer === "Elements");
+
+  if (elementLines.length === 0) {
+    return [];
+  }
+
+  const horizontalLines = elementLines.filter(isHorizontalLine);
+  const verticalLines = elementLines.filter(isVerticalLine);
+  const xCoordinates = [
+    ...new Set(
+      elementLines.flatMap((line) =>
+        line.points.map((point) => roundedCoordinate(point.x))
+      )
+    )
+  ].toSorted((a, b) => a - b);
+  const yCoordinates = [
+    ...new Set(
+      elementLines.flatMap((line) =>
+        line.points.map((point) => roundedCoordinate(point.y))
+      )
+    )
+  ].toSorted((a, b) => a - b);
+  const cells: StrapElementCell[] = [];
+
+  for (let yIndex = 0; yIndex < yCoordinates.length - 1; yIndex += 1) {
+    for (let xIndex = 0; xIndex < xCoordinates.length - 1; xIndex += 1) {
+      const x1 = xCoordinates[xIndex];
+      const x2 = xCoordinates[xIndex + 1];
+      const y1 = yCoordinates[yIndex];
+      const y2 = yCoordinates[yIndex + 1];
+      const hasBottom = horizontalLines.some((line) =>
+        lineCoversHorizontalSpan(line, y1, x1, x2)
+      );
+      const hasTop = horizontalLines.some((line) =>
+        lineCoversHorizontalSpan(line, y2, x1, x2)
+      );
+      const hasLeft = verticalLines.some((line) =>
+        lineCoversVerticalSpan(line, x1, y1, y2)
+      );
+      const hasRight = verticalLines.some((line) =>
+        lineCoversVerticalSpan(line, x2, y1, y2)
+      );
+
+      if (hasBottom && hasTop && hasLeft && hasRight) {
+        cells.push({
+          axis,
+          index: cells.length,
+          polygon: transformDxfPolygon(underlay, [
+            { x: x1, y: y1 },
+            { x: x2, y: y1 },
+            { x: x2, y: y2 },
+            { x: x1, y: y2 }
+          ])
+        });
+      }
+    }
+  }
+
+  return cells;
+}
+
+function collectElementLabelsFromLayer(
+  axis: StrapLayerAxis,
+  underlay: DwgUnderlay | undefined
+) {
+  if (!underlay || underlay.visible === false) {
+    return [];
+  }
+
+  return underlay.texts.reduce<StrapElementLabel[]>((labels, text) => {
+    const elementId = normalizedElementId(text.text);
+
+    if (!elementId) {
+      return labels;
+    }
+
+    const point = transformDxfPoint(underlay, text.position);
+
+    labels.push({ axis, elementId, point, underlay });
+    return labels;
+  }, []);
+}
+
+function median(values: number[]) {
+  if (values.length === 0) {
+    return null;
+  }
+
+  const sorted = values.toSorted((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[middle];
+}
+
+function estimateElementLabelCellSize(labels: StrapElementLabel[]) {
+  const nearestDistances = labels
+    .map((label, index) =>
+      labels.reduce((nearest, other, otherIndex) => {
+        if (index === otherIndex || label.axis !== other.axis) {
+          return nearest;
+        }
+
+        const nextDistance = Math.hypot(
+          other.point.x - label.point.x,
+          other.point.y - label.point.y
+        );
+
+        return nextDistance > 0 ? Math.min(nearest, nextDistance) : nearest;
+      }, Number.POSITIVE_INFINITY)
+    )
+    .filter((value) => Number.isFinite(value));
+  const spacing = median(nearestDistances) ?? 900;
+  const size = Math.max(350, Math.min(1_600, spacing * 0.8));
+
+  return { height: size, width: size };
+}
+
+function collectOverloadedElementsFromLabels(
+  labels: StrapElementLabel[],
+  idResolver: StrapIdResolver
+) {
+  const cellSize = estimateElementLabelCellSize(labels);
+  const seen = new Set<string>();
+
+  return labels.reduce<StrapOverloadedElement[]>((elements, label) => {
+    const key = `${label.axis}-${label.elementId}`;
+    const numericalData = idResolver.resolve(label.elementId);
+
+    if (
+      seen.has(key) ||
+      !numericalData ||
+      numericalData.maxRequiredAs <= BASE_CAPACITY
+    ) {
+      return elements;
+    }
+
+    seen.add(key);
+    elements.push({
+      id: `${key}-label-fallback`,
+      axis: label.axis,
+      elementId: label.elementId,
+      polygon: rectangleAroundPoint(label.point, cellSize.width, cellSize.height),
+      maxRequiredAs: numericalData.maxRequiredAs
+    });
+    return elements;
+  }, []);
+}
+
+function sortLabelsByPosition(labels: StrapElementLabel[]) {
+  return labels.toSorted(
+    (a, b) =>
+      a.axis.localeCompare(b.axis) ||
+      a.point.y - b.point.y ||
+      a.point.x - b.point.x
+  );
+}
+
+function collectOverloadedElementsSequentially(
+  labels: StrapElementLabel[],
+  numericalData: StrapNumericalData[]
+) {
+  const sortedLabels = sortLabelsByPosition(labels);
+  const sortedRows = numericalData.toSorted(
+    (a, b) => Number(a.elementId) - Number(b.elementId)
+  );
+  const cellSize = estimateElementLabelCellSize(sortedLabels);
+
+  return sortedLabels.reduce<StrapOverloadedElement[]>((elements, label, index) => {
+    const numericalDataRow = sortedRows[index];
+
+    if (!numericalDataRow || numericalDataRow.maxRequiredAs <= BASE_CAPACITY) {
+      return elements;
+    }
+
+    elements.push({
+      id: `${label.axis}-${label.elementId}-seq-${numericalDataRow.elementId}`,
+      axis: label.axis,
+      elementId: `${label.elementId} -> ${numericalDataRow.elementId}`,
+      polygon: rectangleAroundPoint(label.point, cellSize.width, cellSize.height),
+      maxRequiredAs: numericalDataRow.maxRequiredAs
+    });
+    return elements;
+  }, []);
+}
+
+function collectOverloadedElementsFromCells(
+  cells: StrapElementCell[],
+  numericalData: StrapNumericalData[]
+) {
+  return cells.reduce<StrapOverloadedElement[]>((elements, cell, index) => {
+    const row = numericalData[index];
+
+    if (!row || row.maxRequiredAs <= BASE_CAPACITY) {
+      return elements;
+    }
+
+    elements.push({
+      id: `${cell.axis}-cell-${index}-${row.elementId}`,
+      axis: cell.axis,
+      elementId: row.elementId,
+      polygon: cell.polygon,
+      maxRequiredAs: row.maxRequiredAs
+    });
+    return elements;
+  }, []);
+}
+
+function collectOverloadedElementsFromLayer(
+  axis: StrapLayerAxis,
+  underlay: DwgUnderlay | undefined,
+  idResolver: StrapIdResolver,
+  calculationBoundary: Point[]
+) {
+  if (!underlay || underlay.visible === false) {
+    return [];
+  }
+
+  const slabArea =
+    calculationBoundary.length >= 3 ? polygonAreaAbs(calculationBoundary) : 0;
+
+  return (underlay.closedPolylines ?? []).reduce<StrapOverloadedElement[]>(
+    (elements, candidate) => {
+      const polygon = transformDxfPolygon(underlay, candidate.polygon);
+      const center = polygonCenter(polygon);
+      const area = polygonAreaAbs(polygon);
+
+      if (
+        polygon.length < 4 ||
+        area <= 0 ||
+        (slabArea > 0 && area > slabArea * 0.2) ||
+        calculationBoundary.length >= 3 &&
+          !pointInPolygon(center, calculationBoundary)
+      ) {
+        return elements;
+      }
+
+      const elementId = findElementIdInsidePolygon(underlay, polygon);
+
+      if (!elementId) {
+        return elements;
+      }
+
+      const numericalData = idResolver.resolve(elementId);
+
+      if (!numericalData || numericalData.maxRequiredAs <= BASE_CAPACITY) {
+        return elements;
+      }
+
+      elements.push({
+        id: `${axis}-${elementId}-${candidate.id}`,
+        axis,
+        elementId,
+        polygon,
+        maxRequiredAs: numericalData.maxRequiredAs
+      });
+      return elements;
+    },
+    []
+  );
 }
 
 function collectRawDeficitPoints(
@@ -1180,6 +1652,127 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     );
   }, [slabGeometry.strapLayerX?.id, slabGeometry.strapLayerY?.id]);
 
+  const setStrapNumericalData = useCallback((data: StrapNumericalData[]) => {
+    setSlabGeometry((current) => ({
+      ...current,
+      strapNumericalData: data,
+      strapOverloadedElements: [],
+      strapAnalysisDebug: undefined
+    }));
+  }, []);
+
+  const runThreeWayAnalysis = useCallback(() => {
+    const numericalDataByElement = new Map(
+      (slabGeometry.strapNumericalData ?? []).map((row) => [
+        row.elementId,
+        row
+      ])
+    );
+    const elementLabels = [
+      ...collectElementLabelsFromLayer("x", slabGeometry.strapLayerX),
+      ...collectElementLabelsFromLayer("y", slabGeometry.strapLayerY)
+    ];
+    const xElementCells = reconstructStrapElementCells("x", slabGeometry.strapLayerX);
+    const yElementCells = reconstructStrapElementCells("y", slabGeometry.strapLayerY);
+    const elementCells =
+      xElementCells.length > 0 ? xElementCells : yElementCells;
+    const cellBasedElements =
+      elementCells.length > 0
+        ? collectOverloadedElementsFromCells(
+            elementCells,
+            slabGeometry.strapNumericalData ?? []
+          )
+        : [];
+    const dxfIds = new Set(elementLabels.map((label) => label.elementId));
+    const idResolver = createStrapIdResolver(numericalDataByElement, dxfIds);
+    const polygonOverloadedElements = [
+      ...collectOverloadedElementsFromLayer(
+        "x",
+        slabGeometry.strapLayerX,
+        idResolver,
+        slabGeometry.boundary
+      ),
+      ...collectOverloadedElementsFromLayer(
+        "y",
+        slabGeometry.strapLayerY,
+        idResolver,
+        slabGeometry.boundary
+      )
+    ];
+    const intersectingIds = [...dxfIds].filter((id) =>
+      Boolean(idResolver.resolveElementId(id))
+    );
+    const polygonKeys = new Set(
+      polygonOverloadedElements.map((element) => `${element.axis}-${element.elementId}`)
+    );
+    const directLabelFallbackElements = collectOverloadedElementsFromLabels(
+      elementLabels.filter(
+        (label) => !polygonKeys.has(`${label.axis}-${label.elementId}`)
+      ),
+      idResolver
+    );
+    const hasRepeatedLocalLabels = dxfIds.size > 0 && elementLabels.length / dxfIds.size > 3;
+    const shouldUseSequentialMapping =
+      hasRepeatedLocalLabels ||
+      intersectingIds.length < Math.min(25, Math.max(1, dxfIds.size * 0.25));
+    const sequentialElements = shouldUseSequentialMapping
+      ? collectOverloadedElementsSequentially(
+          elementLabels,
+          slabGeometry.strapNumericalData ?? []
+        )
+      : [];
+    const strapOverloadedElements =
+      elementCells.length > 0
+        ? cellBasedElements
+        : shouldUseSequentialMapping
+          ? sequentialElements
+          : [...polygonOverloadedElements, ...directLabelFallbackElements];
+    const maxCsvRequiredAs = Math.max(
+      0,
+      ...(slabGeometry.strapNumericalData ?? []).map((row) => row.maxRequiredAs)
+    );
+    const overloadedCsvRows = (slabGeometry.strapNumericalData ?? []).filter(
+      (row) => row.maxRequiredAs > BASE_CAPACITY
+    ).length;
+    const strapAnalysisDebug: StrapAnalysisDebug = {
+      elementLabels: elementLabels.length,
+      matchedElementLabels: elementLabels.filter((label) =>
+        numericalDataByElement.has(label.elementId)
+      ).length,
+      polygonCandidates:
+        (slabGeometry.strapLayerX?.closedPolylines?.length ?? 0) +
+        (slabGeometry.strapLayerY?.closedPolylines?.length ?? 0),
+      overloadedElements: strapOverloadedElements.length,
+      elementCellCandidates: elementCells.length,
+      sampleCsvElementIds: [...numericalDataByElement.keys()].slice(0, 8),
+      sampleDxfElementIds: [...dxfIds].slice(0, 8),
+      sampleMatchedElementIds: intersectingIds.slice(0, 8),
+      inferredIdOffset: idResolver.offset ?? undefined,
+      matchedUniqueIds: intersectingIds.length,
+      matchingMode:
+        elementCells.length > 0
+          ? "elements-grid"
+          : shouldUseSequentialMapping
+            ? "sequential"
+            : "direct-or-offset",
+      maxCsvRequiredAs,
+      overloadedCsvRows
+    };
+
+    setSlabGeometry((current) => ({
+      ...current,
+      strapOverloadedElements,
+      strapAnalysisDebug
+    }));
+
+    return strapOverloadedElements.length;
+  }, [
+    slabGeometry.boundary,
+    slabGeometry.strapLayerX,
+    slabGeometry.strapLayerY,
+    slabGeometry.strapNumericalData
+  ]);
+
   const generateRawDeficitZones = useCallback(() => {
     const deficitPoints = [
       ...collectRawDeficitPoints(slabGeometry.strapLayerX, slabGeometry.boundary),
@@ -1375,6 +1968,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       deleteCalculatedSlab,
       deleteDxfUnderlay,
       deleteStrapLayer,
+      runThreeWayAnalysis,
       setSelectedDesignAreaId,
       setDesignAreaVisible,
       updateDesignAreaPurpose,
@@ -1400,6 +1994,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       setDxfUnderlayScale,
       setDxfUnderlayVisible,
       setStrapLayer,
+      setStrapNumericalData,
       setUnderlayLayerVisible,
       translateDxfUnderlay,
       updateActiveMeshZone,
@@ -1436,6 +2031,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       deleteCalculatedSlab,
       deleteDxfUnderlay,
       deleteStrapLayer,
+      runThreeWayAnalysis,
       setSelectedDesignAreaId,
       setDesignAreaVisible,
       updateDesignAreaPurpose,
@@ -1461,6 +2057,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       setDxfUnderlayScale,
       setDxfUnderlayVisible,
       setStrapLayer,
+      setStrapNumericalData,
       translateDxfUnderlay,
       updateActiveMeshZone,
       updateActiveMeshZoneParameters,
