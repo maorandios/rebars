@@ -9,6 +9,8 @@ import {
   generateBaseMeshLayout
 } from "@/lib/geometry/mesh-sheet-layout";
 import type {
+  AnalysisEvidenceCell,
+  AnalysisIsland,
   BaseMeshSettings,
   CadArcEntity,
   CadCircleEntity,
@@ -17,6 +19,7 @@ import type {
   DwgUnderlay,
   MeshSheet,
   MeshZone,
+  ExtraMeshDesignZone,
   Point,
   Polygon,
   RawDeficitZone,
@@ -24,7 +27,6 @@ import type {
   SlabGeometry,
   SlabOpening,
   StrapExtraMeshZone,
-  StrapOverloadedElement,
   StructuralElement
 } from "@/types/structure";
 
@@ -459,26 +461,400 @@ function drawRawDeficitZones(
   }
 }
 
-function drawStrapOverloadedElement(
+function demandOpacity(requiredAs: number, maxRequiredAs: number) {
+  const ratio = maxRequiredAs > 0 ? requiredAs / maxRequiredAs : 0;
+
+  return Math.max(0.08, Math.min(0.9, ratio ** 1.6 * 0.9));
+}
+
+function parseContourLabelValue(text: string) {
+  const normalized = text.replace(",", ".").trim();
+  const match = normalized.match(/[-+]?\d*\.?\d+/);
+
+  if (!match) {
+    return null;
+  }
+
+  const value = Number(match[0]);
+
+  return Number.isFinite(value) ? value : null;
+}
+
+function lineCenter(points: Point[]) {
+  return points.reduce(
+    (sum, point, _, allPoints) => ({
+      x: sum.x + point.x / allPoints.length,
+      y: sum.y + point.y / allPoints.length
+    }),
+    { x: 0, y: 0 }
+  );
+}
+
+function pointToSegmentDistance(point: Point, start: Point, end: Point) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSquared = dx * dx + dy * dy;
+
+  if (lengthSquared === 0) {
+    return Math.hypot(point.x - start.x, point.y - start.y);
+  }
+
+  const t = Math.max(
+    0,
+    Math.min(
+      1,
+      ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared
+    )
+  );
+  const projection = {
+    x: start.x + t * dx,
+    y: start.y + t * dy
+  };
+
+  return Math.hypot(point.x - projection.x, point.y - projection.y);
+}
+
+function pointToPolylineDistance(point: Point, points: Point[]) {
+  if (points.length === 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  if (points.length === 1) {
+    return Math.hypot(point.x - points[0].x, point.y - points[0].y);
+  }
+
+  return points.slice(0, -1).reduce((nearest, start, index) => {
+    const end = points[index + 1];
+
+    return Math.min(nearest, pointToSegmentDistance(point, start, end));
+  }, Number.POSITIVE_INFINITY);
+}
+
+function isContourLayer(layer: string) {
+  const normalized = layer.toUpperCase();
+
+  return (
+    normalized.includes("CONTOUR") ||
+    normalized.includes("CONTO") ||
+    normalized.includes("ASX") ||
+    normalized.includes("ASY")
+  );
+}
+
+function isLikelyContourLine(line: CadLineEntity) {
+  if (isContourLayer(line.layer)) {
+    return true;
+  }
+
+  if (line.points.length < 3) {
+    return false;
+  }
+
+  const first = line.points[0];
+  const last = line.points.at(-1) ?? first;
+  const isClosed = Math.hypot(first.x - last.x, first.y - last.y) < 1;
+  const hasDirectionChange = line.points.slice(1, -1).some((point, index) => {
+    const previous = line.points[index];
+    const next = line.points[index + 2];
+    const firstAngle = Math.atan2(point.y - previous.y, point.x - previous.x);
+    const nextAngle = Math.atan2(next.y - point.y, next.x - point.x);
+
+    return Math.abs(firstAngle - nextAngle) > 0.08;
+  });
+
+  return (isClosed && line.points.length > 5) || hasDirectionChange;
+}
+
+type DisplayContourLine = {
+  id: string;
+  points: Point[];
+  value?: number;
+};
+
+function assignContourValues(
+  contourLines: DisplayContourLine[],
+  contourLabels: { point: Point; value: number }[]
+) {
+  const valuesByLine = new Map<string, number[]>();
+
+  for (const label of contourLabels) {
+    const nearest = contourLines.reduce<{
+      distance: number;
+      line: DisplayContourLine;
+    } | null>((currentNearest, line) => {
+      const distance = pointToPolylineDistance(label.point, line.points);
+
+      if (!currentNearest || distance < currentNearest.distance) {
+        return { distance, line };
+      }
+
+      return currentNearest;
+    }, null);
+
+    if (!nearest) {
+      continue;
+    }
+
+    valuesByLine.set(nearest.line.id, [
+      ...(valuesByLine.get(nearest.line.id) ?? []),
+      label.value
+    ]);
+  }
+
+  const labeledLines = contourLines
+    .map((line) => {
+      const values = valuesByLine.get(line.id);
+
+      return values
+        ? {
+            ...line,
+            value: values.reduce((sum, value) => sum + value / values.length, 0)
+          }
+        : line;
+    })
+    .filter((line): line is DisplayContourLine & { value: number } =>
+      Boolean(line.value)
+    );
+
+  return contourLines.map((line) => {
+    const directValues = valuesByLine.get(line.id);
+
+    if (directValues) {
+      return {
+        ...line,
+        value: directValues.reduce((sum, value) => sum + value / directValues.length, 0)
+      };
+    }
+
+    const center = lineCenter(line.points);
+    const nearestLabeledLine = labeledLines.reduce<{
+      distance: number;
+      value: number;
+    } | null>((nearest, labeledLine) => {
+      const distance = pointToPolylineDistance(center, labeledLine.points);
+
+      if (!nearest || distance < nearest.distance) {
+        return { distance, value: labeledLine.value };
+      }
+
+      return nearest;
+    }, null);
+
+    return {
+      ...line,
+      value: nearestLabeledLine?.value
+    };
+  });
+}
+
+function drawAnalysisAxisContourLines(
   context: CanvasRenderingContext2D,
-  element: StrapOverloadedElement,
+  slabGeometry: SlabGeometry,
+  axis: AnalysisEvidenceCell["axis"],
   scale: number
 ) {
-  const color = element.axis === "x" ? "#e879f9" : "#fb923c";
+  const underlay = axis === "x" ? slabGeometry.strapLayerX : slabGeometry.strapLayerY;
+
+  if (!underlay) {
+    return;
+  }
+
+  const visibleLayers = visibleUnderlayLayers(underlay);
+  const contourLabels = underlay.texts
+    .filter(
+      (text) =>
+        (visibleLayers.size === 0 || isLayerVisible(visibleLayers, text.layer))
+    )
+    .map((text) => ({
+      point: transformDxfPoint(underlay, text.position),
+      value: parseContourLabelValue(text.text)
+    }))
+    .filter(
+      (label): label is { point: Point; value: number } =>
+        label.value !== null && label.value > 0 && label.value <= 100
+    );
+  const maxContourValue = Math.max(0, ...contourLabels.map((label) => label.value));
+
+  if (maxContourValue <= 0) {
+    return;
+  }
+
+  const contourLines: DisplayContourLine[] = [
+    ...underlay.lines
+      .filter(
+        (line) =>
+          isLikelyContourLine(line) &&
+          line.points.length >= 2 &&
+          (visibleLayers.size === 0 || isLayerVisible(visibleLayers, line.layer))
+      )
+      .map((line) => ({
+        id: line.id,
+        points: line.points.map((point) => transformDxfPoint(underlay, point))
+      })),
+    ...(underlay.closedPolylines ?? [])
+      .filter(
+        (candidate) =>
+          (isContourLayer(candidate.layer) || candidate.polygon.length > 4) &&
+          (visibleLayers.size === 0 || isLayerVisible(visibleLayers, candidate.layer))
+      )
+      .map((candidate) => ({
+        id: candidate.id,
+        points: [...candidate.polygon, candidate.polygon[0]].map((point) =>
+          transformDxfPoint(underlay, point)
+        )
+      }))
+  ].filter((line) => line.points.length >= 2);
+  const valuedContourLines = assignContourValues(contourLines, contourLabels).toSorted(
+    (a, b) => (a.value ?? 0) - (b.value ?? 0)
+  );
 
   context.save();
-  drawPolygonPath(context, element.polygon);
-  context.fillStyle = color;
-  context.globalAlpha = 0.16;
+  for (const line of valuedContourLines) {
+    const value = line.value;
+    const opacity = value ? demandOpacity(value, maxContourValue) : 0.1;
+    const ratio = value ? value / maxContourValue : 0.1;
+
+    drawPolylinePath(context, line.points);
+    setDraftStroke(context, scale, {
+      alpha: opacity,
+      color: "#f87171",
+      dash: axis === "y" ? [8, 5] : undefined,
+      widthPx: 0.9 + Math.min(1.4, ratio * 1.4)
+    });
+    context.stroke();
+    resetDraftStroke(context);
+  }
+  context.restore();
+}
+
+function drawAnalysisIslandLabel(
+  context: CanvasRenderingContext2D,
+  island: AnalysisIsland,
+  index: number,
+  scale: number
+) {
+  const center = polygonCenter(island.polygon);
+  const labelParts = [`I${index + 1}`];
+
+  if (island.maxRequiredAsX > 0) {
+    labelParts.push(`X ${Math.round(island.maxRequiredAsX)}`);
+  }
+  if (island.maxRequiredAsY > 0) {
+    labelParts.push(`Y ${Math.round(island.maxRequiredAsY)}`);
+  }
+
+  drawText(context, labelParts.join(" | "), center.x, center.y, scale, {
+    color: "#fef08a",
+    height: cadTextHeight.small
+  });
+}
+
+function drawAnalysisHeatMap(
+  context: CanvasRenderingContext2D,
+  slabGeometry: SlabGeometry,
+  scale: number,
+  analysisViewMode: "x" | "y" | "both"
+) {
+  const islands = slabGeometry.analysisIslands ?? [];
+
+  context.save();
+  clipToSlabBoundary(context, slabGeometry);
+  if (analysisViewMode === "x" || analysisViewMode === "both") {
+    drawAnalysisAxisContourLines(context, slabGeometry, "x", scale);
+  }
+  if (analysisViewMode === "y" || analysisViewMode === "both") {
+    drawAnalysisAxisContourLines(context, slabGeometry, "y", scale);
+  }
+  context.restore();
+
+  for (const [index, island] of islands.entries()) {
+    drawAnalysisIslandLabel(context, island, index, scale);
+  }
+}
+
+function scheduleText(schedule: ExtraMeshDesignZone["recommendedSchedule"]) {
+  const parts = [];
+
+  if (schedule?.x) {
+    parts.push(
+      `X Ø${schedule.x.diameter}@${schedule.x.spacing} (${Math.round(
+        schedule.x.providedAs
+      )})${schedule.x.isAdequate ? "" : " - insufficient"}`
+    );
+  }
+  if (schedule?.y) {
+    parts.push(
+      `Y Ø${schedule.y.diameter}@${schedule.y.spacing} (${Math.round(
+        schedule.y.providedAs
+      )})${schedule.y.isAdequate ? "" : " - insufficient"}`
+    );
+  }
+
+  return parts.length > 0 ? parts.join("\n") : "No extra mesh required";
+}
+
+function zoneScheduleTypeText(
+  zone: ExtraMeshDesignZone,
+  slabGeometry: SlabGeometry
+) {
+  const scheduleTypes = slabGeometry.extraMeshScheduleTypes ?? [];
+  const labels = [
+    zone.scheduleTypeIds?.x
+      ? scheduleTypes.find((type) => type.id === zone.scheduleTypeIds?.x)?.label
+      : null,
+    zone.scheduleTypeIds?.y
+      ? scheduleTypes.find((type) => type.id === zone.scheduleTypeIds?.y)?.label
+      : null
+  ].filter(Boolean);
+
+  return labels.length > 0 ? labels.join(" / ") : zone.direction.toUpperCase();
+}
+
+function drawExtraMeshDesignZone(
+  context: CanvasRenderingContext2D,
+  zone: ExtraMeshDesignZone,
+  slabGeometry: SlabGeometry,
+  scale: number
+) {
+  const center = polygonCenter(zone.polygon);
+
+  context.save();
+  drawPolygonPath(context, zone.polygon);
+  context.fillStyle = "#7c3aed";
+  context.globalAlpha = 0.22;
   context.fill();
   context.globalAlpha = 1;
   setDraftStroke(context, scale, {
-    color,
-    widthPx: 0.8
+    color: "#c4b5fd",
+    dash: zone.status === "proposed" ? [18, 8] : undefined,
+    widthPx: 3.2
   });
   context.stroke();
   resetDraftStroke(context);
+  drawText(
+    context,
+    `${zone.label}\n${zoneScheduleTypeText(zone, slabGeometry)} | Islands ${
+      zone.coveredIslandIds.length
+    }\n${scheduleText(zone.recommendedSchedule)}`,
+    center.x,
+    center.y,
+    scale,
+    {
+      color: "#ffffff",
+      height: cadTextHeight.small
+    }
+  );
   context.restore();
+}
+
+function drawExtraMeshDesignZones(
+  context: CanvasRenderingContext2D,
+  slabGeometry: SlabGeometry,
+  scale: number
+) {
+  for (const zone of slabGeometry.extraMeshDesignZones ?? []) {
+    drawExtraMeshDesignZone(context, zone, slabGeometry, scale);
+  }
 }
 
 function drawStrapExtraMeshZone(
@@ -513,16 +889,6 @@ function drawStrapExtraMeshZone(
     }
   );
   context.restore();
-}
-
-function drawStrapOverloadedElements(
-  context: CanvasRenderingContext2D,
-  slabGeometry: SlabGeometry,
-  scale: number
-) {
-  for (const element of slabGeometry.strapOverloadedElements ?? []) {
-    drawStrapOverloadedElement(context, element, scale);
-  }
 }
 
 function drawStrapExtraMeshZones(
@@ -585,7 +951,8 @@ function drawDxfUnderlayReference(
 function drawDwgUnderlay(
   context: CanvasRenderingContext2D,
   slabGeometry: SlabGeometry,
-  scale: number
+  scale: number,
+  showRawStrapLayers: boolean
 ) {
   const dxfReferences =
     slabGeometry.dxfUnderlays ??
@@ -608,12 +975,14 @@ function drawDwgUnderlay(
     drawDxfUnderlayReference(context, underlay, scale);
   }
 
-  context.globalAlpha = 0.7;
-  if (slabGeometry.strapLayerX) {
-    drawDxfUnderlayReference(context, slabGeometry.strapLayerX, scale, "#e879f9");
-  }
-  if (slabGeometry.strapLayerY) {
-    drawDxfUnderlayReference(context, slabGeometry.strapLayerY, scale, "#fb923c");
+  if (showRawStrapLayers) {
+    context.globalAlpha = 0.16;
+    if (slabGeometry.strapLayerX) {
+      drawDxfUnderlayReference(context, slabGeometry.strapLayerX, scale, "#f87171");
+    }
+    if (slabGeometry.strapLayerY) {
+      drawDxfUnderlayReference(context, slabGeometry.strapLayerY, scale, "#f87171");
+    }
   }
 
   context.globalAlpha = 0.38;
@@ -1256,6 +1625,9 @@ export function StructureCanvas() {
     editingDesignAreaId,
     isDrawingDesignArea,
     designAreaDrawingMode,
+    designAreaDrawingPurpose,
+    analysisViewMode,
+    showRawStrapLayers,
     boundaryDraftPoints,
     designAreaDraftPoints,
     addBoundaryTracePoint,
@@ -1280,7 +1652,6 @@ export function StructureCanvas() {
       ),
     [activeMeshZone.geometry, activeMeshZone.parameters, slabGeometry]
   );
-
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d");
@@ -1323,7 +1694,12 @@ export function StructureCanvas() {
       panRef.current.x,
       panRef.current.y
     );
-    drawDwgUnderlay(context, slabGeometry, scaleRef.current);
+    drawDwgUnderlay(
+      context,
+      slabGeometry,
+      scaleRef.current,
+      showRawStrapLayers
+    );
     drawStructuralBackground(context, slabGeometry, scaleRef.current);
     if (slabGeometry.hasActiveSlabBoundary ?? true) {
       if (slabGeometry.dwgUnderlay?.reviewOnly) {
@@ -1344,8 +1720,14 @@ export function StructureCanvas() {
           }
           drawDesignAreas(context, slabGeometry, scaleRef.current);
           drawRawDeficitZones(context, slabGeometry, scaleRef.current);
-          drawStrapOverloadedElements(context, slabGeometry, scaleRef.current);
+          drawAnalysisHeatMap(
+            context,
+            slabGeometry,
+            scaleRef.current,
+            analysisViewMode
+          );
           drawStrapExtraMeshZones(context, slabGeometry, scaleRef.current);
+          drawExtraMeshDesignZones(context, slabGeometry, scaleRef.current);
           const editingDesignArea = (slabGeometry.designAreas ?? []).find(
             (area) => area.id === editingDesignAreaId
           );
@@ -1394,8 +1776,14 @@ export function StructureCanvas() {
       }
       drawDesignAreas(context, slabGeometry, scaleRef.current);
       drawRawDeficitZones(context, slabGeometry, scaleRef.current);
-      drawStrapOverloadedElements(context, slabGeometry, scaleRef.current);
+      drawAnalysisHeatMap(
+        context,
+        slabGeometry,
+        scaleRef.current,
+        analysisViewMode
+      );
       drawStrapExtraMeshZones(context, slabGeometry, scaleRef.current);
+      drawExtraMeshDesignZones(context, slabGeometry, scaleRef.current);
       const editingDesignArea = (slabGeometry.designAreas ?? []).find(
         (area) => area.id === editingDesignAreaId
       );
@@ -1428,12 +1816,14 @@ export function StructureCanvas() {
   }, [
     activeMeshZone.parameters,
     activeZoneId,
+    analysisViewMode,
     boundaryDraftPoints,
     editingDesignAreaId,
     isEditingBoundary,
     designAreaDraftPoints,
     meshZones,
     slabGeometry,
+    showRawStrapLayers,
     snapPoint
   ]);
 
@@ -2128,14 +2518,18 @@ export function StructureCanvas() {
       ) : null}
       {editingDesignAreaId ? (
         <div className="pointer-events-none absolute left-1/2 top-20 z-10 max-w-md -translate-x-1/2 rounded-md border border-amber-400/30 bg-background/90 px-4 py-2 text-sm font-medium text-amber-300 shadow-sm backdrop-blur">
-          Drag amber area points to edit the no-mesh area
+          Drag amber area points to edit the design area
         </div>
       ) : null}
       {isDrawingDesignArea ? (
         <div className="pointer-events-none absolute left-1/2 top-20 z-10 max-w-md -translate-x-1/2 rounded-md border border-amber-400/30 bg-background/90 px-4 py-2 text-sm font-medium text-amber-300 shadow-sm backdrop-blur">
-          {designAreaDrawingMode === "rectangle"
-            ? "Drag a rectangular no-mesh area."
-            : "Click DXF vertices to trace a no-mesh area, then finish."}
+          {designAreaDrawingPurpose === "extra-mesh"
+            ? designAreaDrawingMode === "rectangle"
+              ? "Drag the extra mesh design zone around hot regions."
+              : "Trace the extra mesh design zone around hot regions, then finish."
+            : designAreaDrawingMode === "rectangle"
+              ? "Drag a rectangular no-mesh area."
+              : "Click DXF vertices to trace a no-mesh area, then finish."}
         </div>
       ) : null}
     </div>

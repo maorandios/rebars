@@ -37,6 +37,7 @@ import { removeSlabGeometryProject } from "@/lib/project-storage";
 import type {
   BaseMeshSettings,
   BaseMeshSettingsUpdate,
+  ExtraMeshSchedule,
   StrapNumericalData
 } from "@/types/structure";
 
@@ -96,6 +97,31 @@ function draftNumber(value: string, fallback: number) {
 
 function squareMeters(value: number) {
   return (value / 1_000_000).toFixed(1);
+}
+
+function roundedAs(value: number) {
+  return Math.round(value).toLocaleString();
+}
+
+function formatSchedule(schedule: ExtraMeshSchedule) {
+  const status = schedule.isAdequate
+    ? ""
+    : ` | insufficient by ${roundedAs(schedule.shortfall)} mm²/m`;
+
+  return `Ø${schedule.diameter}@${schedule.spacing} (${roundedAs(
+    schedule.providedAs
+  )} mm²/m)${status}`;
+}
+
+function scheduleTypeLabel(
+  scheduleTypeId: string | undefined,
+  scheduleTypes: NonNullable<
+    import("@/types/structure").SlabGeometry["extraMeshScheduleTypes"]
+  >
+) {
+  return scheduleTypeId
+    ? scheduleTypes.find((type) => type.id === scheduleTypeId)?.label
+    : undefined;
 }
 
 function parseNumberToken(value: string) {
@@ -227,7 +253,19 @@ export function MeshZonesPanel({
     deleteStrapLayer,
     setStrapNumericalData,
     runThreeWayAnalysis,
+    clearStrapAnalysis,
     generateRawDeficitZones,
+    beginDesignAreaDraw,
+    cancelDesignAreaDraw,
+    finishDesignAreaDraft,
+    isDrawingDesignArea,
+    designAreaDrawingMode,
+    designAreaDrawingPurpose,
+    designAreaDraftPoints,
+    analysisViewMode,
+    showRawStrapLayers,
+    setAnalysisViewMode,
+    setShowRawStrapLayers,
     translateDxfUnderlay,
     setSelectedDesignAreaId,
     setActiveZoneId
@@ -277,6 +315,14 @@ export function MeshZonesPanel({
       label: "STRAP Y Axis"
     }
   ];
+  const hasClearableStrapAnalysis = Boolean(
+    slabGeometry.analysisEvidenceCells?.length ||
+      slabGeometry.analysisIslands?.length ||
+      slabGeometry.extraMeshDesignZones?.length ||
+      slabGeometry.rawDeficitZones?.length ||
+      slabGeometry.strapOverloadedElements?.length ||
+      slabGeometry.strapAnalysisDebug
+  );
   async function handleAdditionalDxfUpload(file: File | undefined) {
     if (!file) {
       return;
@@ -679,23 +725,57 @@ export function MeshZonesPanel({
               >
                 בצע הצלבה הנדסית משולבת
               </Button>
+              <div className="mt-3 rounded-xl border bg-background/40 p-2">
+                <div className="mb-2 text-xs font-medium text-muted-foreground">
+                  Analysis display
+                </div>
+                <div className="grid grid-cols-3 gap-1">
+                  {(["x", "y", "both"] as const).map((mode) => (
+                    <Button
+                      key={mode}
+                      className="h-8 px-2 text-xs"
+                      type="button"
+                      variant={analysisViewMode === mode ? "secondary" : "outline"}
+                      onClick={() => setAnalysisViewMode(mode)}
+                    >
+                      {mode === "x" ? "X" : mode === "y" ? "Y" : "Both"}
+                    </Button>
+                  ))}
+                </div>
+                <Button
+                  className="mt-2 h-8 w-full text-xs"
+                  type="button"
+                  variant={showRawStrapLayers ? "secondary" : "outline"}
+                  onClick={() => setShowRawStrapLayers(!showRawStrapLayers)}
+                >
+                  {showRawStrapLayers ? "Hide raw STRAP" : "Show raw STRAP"}
+                </Button>
+              </div>
+              <Button
+                className="mt-2 w-full"
+                disabled={!hasClearableStrapAnalysis}
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  clearStrapAnalysis();
+                  setStrapUploadStatus(
+                    "Cleared analysis overlays and manual extra mesh zones. STRAP files remain loaded."
+                  );
+                }}
+              >
+                Clear analysis + extra mesh zones
+              </Button>
               <div className="mt-2 text-xs text-muted-foreground">
                 Data rows: {slabGeometry.strapNumericalData?.length ?? 0} |
                 Overloaded elements:{" "}
                 {slabGeometry.strapOverloadedElements?.length ?? 0}
                 {" "}|
-                Extra mesh zones: {slabGeometry.strapExtraMeshZones?.length ?? 0}
+                Heat cells: {slabGeometry.analysisEvidenceCells?.length ?? 0}
               </div>
               <div className="mt-1 text-xs text-muted-foreground">
-                Strips:{" "}
-                {slabGeometry.strapExtraMeshZones?.filter(
-                  (zone) => zone.kind === "strip"
-                ).length ?? 0}
+                Islands: {slabGeometry.analysisIslands?.length ?? 0}
                 {" "}|
-                Patches:{" "}
-                {slabGeometry.strapExtraMeshZones?.filter(
-                  (zone) => zone.kind === "patch"
-                ).length ?? 0}
+                Manual zones: {slabGeometry.extraMeshDesignZones?.length ?? 0}
               </div>
               {slabGeometry.strapAnalysisDebug ? (
                 <div className="mt-2 rounded-xl border border-fuchsia-300/20 bg-background/40 p-2 text-xs leading-5 text-muted-foreground">
@@ -725,7 +805,7 @@ export function MeshZonesPanel({
                   Contour points over 393:{" "}
                   {slabGeometry.strapAnalysisDebug.contourDeficitPoints ?? 0}
                   <br />
-                  Extra mesh zones:{" "}
+                  Analysis islands:{" "}
                   {slabGeometry.strapAnalysisDebug.extraMeshZones ?? 0}
                   <br />
                   Inferred ID offset:{" "}
@@ -750,6 +830,162 @@ export function MeshZonesPanel({
                   ) ?? "-"}
                 </div>
               ) : null}
+            </div>
+            <div className="rounded-2xl border border-violet-300/25 bg-violet-300/10 p-4">
+              <div className="text-sm font-semibold text-foreground">
+                Engineer-Defined Extra Mesh Zones
+              </div>
+              <p className="mt-2 text-xs leading-5 text-violet-100/80">
+                Use the heat map as evidence, then trace the real constructible
+                zones where extra mesh should be applied.
+              </p>
+              <div className="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
+                <div className="rounded-xl border bg-background/40 p-2">
+                  <div className="text-lg font-semibold text-foreground">
+                    {slabGeometry.analysisEvidenceCells?.length ?? 0}
+                  </div>
+                  <div className="text-muted-foreground">heat cells</div>
+                </div>
+                <div className="rounded-xl border bg-background/40 p-2">
+                  <div className="text-lg font-semibold text-foreground">
+                    {slabGeometry.analysisIslands?.length ?? 0}
+                  </div>
+                  <div className="text-muted-foreground">islands</div>
+                </div>
+                <div className="rounded-xl border bg-background/40 p-2">
+                  <div className="text-lg font-semibold text-foreground">
+                    {slabGeometry.extraMeshDesignZones?.length ?? 0}
+                  </div>
+                  <div className="text-muted-foreground">zones</div>
+                </div>
+              </div>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <Button
+                  disabled={!hasActiveSlabBoundary}
+                  type="button"
+                  variant={
+                    isDrawingDesignArea &&
+                    designAreaDrawingPurpose === "extra-mesh" &&
+                    designAreaDrawingMode === "polygon"
+                      ? "secondary"
+                      : "outline"
+                  }
+                  onClick={() => beginDesignAreaDraw("polygon", "extra-mesh")}
+                >
+                  Trace Zone
+                </Button>
+                <Button
+                  disabled={!hasActiveSlabBoundary}
+                  type="button"
+                  variant={
+                    isDrawingDesignArea &&
+                    designAreaDrawingPurpose === "extra-mesh" &&
+                    designAreaDrawingMode === "rectangle"
+                      ? "secondary"
+                      : "outline"
+                  }
+                  onClick={() => beginDesignAreaDraw("rectangle", "extra-mesh")}
+                >
+                  Rect Zone
+                </Button>
+              </div>
+              {isDrawingDesignArea && designAreaDrawingPurpose === "extra-mesh" ? (
+                <div className="mt-3 rounded-xl border border-violet-300/30 bg-background/40 p-2 text-xs leading-5 text-violet-100">
+                  {designAreaDrawingMode === "polygon"
+                    ? `Trace points: ${designAreaDraftPoints.length}`
+                    : "Drag the zone rectangle on the canvas."}
+                  <div className="mt-2 flex gap-2">
+                    {designAreaDrawingMode === "polygon" ? (
+                      <Button
+                        className="h-8 flex-1"
+                        disabled={designAreaDraftPoints.length < 3}
+                        type="button"
+                        variant="secondary"
+                        onClick={finishDesignAreaDraft}
+                      >
+                        Finish
+                      </Button>
+                    ) : null}
+                    <Button
+                      className="h-8 flex-1"
+                      type="button"
+                      variant="outline"
+                      onClick={cancelDesignAreaDraw}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+              {(slabGeometry.extraMeshScheduleTypes ?? []).length > 0 ? (
+                <div className="mt-3 rounded-xl border bg-background/40 p-3 text-xs leading-5 text-muted-foreground">
+                  <div className="font-semibold text-foreground">
+                    Shared schedule types
+                  </div>
+                  <div className="mt-2 space-y-1">
+                    {(slabGeometry.extraMeshScheduleTypes ?? []).map((type) => (
+                      <div key={type.id}>
+                        <span className="font-medium text-violet-100">
+                          {type.label}
+                        </span>
+                        {": "}Ø{type.diameter}@{type.spacing} | provides{" "}
+                        {roundedAs(type.providedAs)} mm²/m | zones{" "}
+                        {type.assignedZoneIds.length}
+                        {type.isAdequate
+                          ? ""
+                          : ` | insufficient by ${roundedAs(type.shortfall)} mm²/m`}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              <div className="mt-3 space-y-2">
+                {(slabGeometry.extraMeshDesignZones ?? []).length === 0 ? (
+                  <div className="rounded-xl border border-dashed p-3 text-xs leading-5 text-muted-foreground">
+                    No manual extra mesh zones yet. Run the analysis, then trace
+                    one or more zones around the hot regions.
+                  </div>
+                ) : null}
+                {(slabGeometry.extraMeshDesignZones ?? []).map((zone) => (
+                  <div
+                    key={zone.id}
+                    className="rounded-xl border bg-background/50 p-3 text-xs leading-5"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="font-semibold text-foreground">{zone.label}</div>
+                      <span className="rounded-full bg-violet-300/15 px-2 py-0.5 text-violet-100">
+                        {zone.status}
+                      </span>
+                    </div>
+                    <div className="mt-1 text-muted-foreground">
+                      Direction {zone.direction.toUpperCase()} | Islands{" "}
+                      {zone.coveredIslandIds.length} | Cells{" "}
+                      {zone.coveredEvidenceCellIds.length}
+                    </div>
+                    <div className="mt-2 rounded-lg bg-background/60 p-2 text-muted-foreground">
+                      X required extra: {roundedAs(zone.demand.requiredExtraAsX)} mm²/m
+                      {zone.recommendedSchedule?.x
+                        ? ` | ${
+                            scheduleTypeLabel(
+                              zone.scheduleTypeIds?.x,
+                              slabGeometry.extraMeshScheduleTypes ?? []
+                            ) ?? "X"
+                          } ${formatSchedule(zone.recommendedSchedule.x)}`
+                        : ""}
+                      <br />
+                      Y required extra: {roundedAs(zone.demand.requiredExtraAsY)} mm²/m
+                      {zone.recommendedSchedule?.y
+                        ? ` | ${
+                            scheduleTypeLabel(
+                              zone.scheduleTypeIds?.y,
+                              slabGeometry.extraMeshScheduleTypes ?? []
+                            ) ?? "Y"
+                          } ${formatSchedule(zone.recommendedSchedule.y)}`
+                        : ""}
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
             {strapLayers.map(({ axis, color, label, layer }) => {
               const layerId = layer?.id ?? `strap-${axis}`;
@@ -993,12 +1229,12 @@ export function MeshZonesPanel({
             {hasGeneratedWorkingSlab ? (
               <div className="space-y-2">
                 <div className="px-1 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">
-                  No Mesh Areas
+                  Design Areas
                 </div>
                 {designAreas.length === 0 ? (
                   <div className="rounded-xl border border-dashed p-3 text-xs leading-5 text-muted-foreground">
-                    No no-mesh areas yet. Select SLAB and use the right
-                    controller to draw one.
+                    No design areas yet. Select SLAB for no-mesh areas or
+                    ANALYSIS for extra mesh zones.
                   </div>
                 ) : null}
                 {designAreas.map((area) => (
@@ -1022,7 +1258,7 @@ export function MeshZonesPanel({
                         {area.label}
                       </span>
                       <span className="rounded-full bg-amber-300/15 px-2 py-0.5 text-xs text-amber-100">
-                        no mesh
+                        {area.purpose === "extra-mesh" ? "extra mesh" : "no mesh"}
                       </span>
                     </div>
                     <div className="mt-1 text-xs text-muted-foreground">
@@ -1422,7 +1658,7 @@ export function MeshInspectorPanel({
         : inspectorContext.type === "slab"
           ? "Define, edit, and manage the working slab"
           : inspectorContext.type === "areas" || inspectorContext.type === "area"
-            ? "No-mesh area controls"
+            ? "Design area controls"
             : "Base mesh parameters and mesh creation tools";
 
   return (
@@ -1669,8 +1905,8 @@ export function MeshInspectorPanel({
                       {isDrawingDesignArea ? (
                         <div className="mt-3 rounded-xl border border-amber-400/30 bg-amber-400/10 p-2 text-xs leading-5 text-amber-100">
                           {designAreaDrawingMode === "polygon"
-                            ? `Opening points: ${designAreaDraftPoints.length}`
-                            : "Drag a rectangle opening on the slab."}
+                            ? `Area points: ${designAreaDraftPoints.length}`
+                            : "Drag a rectangle area on the slab."}
                           <div className="mt-2 flex gap-2">
                             {designAreaDrawingMode === "polygon" ? (
                               <Button
@@ -1756,8 +1992,8 @@ export function MeshInspectorPanel({
             <div className="space-y-3">
               {designAreas.length === 0 ? (
                 <div className="rounded-2xl border border-dashed p-4 text-sm text-muted-foreground">
-                  No no-mesh areas yet. Use the SLAB controller to draw a vertex
-                  or rectangle area.
+                  No design areas yet. Use the SLAB controller to draw no-mesh
+                  areas, or the ANALYSIS dock to draw extra mesh zones.
                 </div>
               ) : null}
               {designAreas.map((area) => (
@@ -1775,7 +2011,7 @@ export function MeshInspectorPanel({
                       {area.label}
                     </span>
                     <span className="rounded-full bg-amber-300/15 px-2 py-0.5 text-xs text-amber-100">
-                      no mesh
+                        {area.purpose === "extra-mesh" ? "extra mesh" : "no mesh"}
                     </span>
                   </div>
                   <div className="mt-1 text-xs text-muted-foreground">

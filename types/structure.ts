@@ -106,6 +106,7 @@ export type SlabDesignArea = {
   visible: boolean;
   source: SlabDesignAreaSource;
   meshZoneId?: string;
+  extraMeshDesignZoneId?: string;
 };
 
 export type RawDeficitZone = {
@@ -131,6 +132,69 @@ export type StrapOverloadedElement = {
   elementId: string;
   polygon: Polygon;
   maxRequiredAs: number;
+};
+
+export type AnalysisEvidenceCell = {
+  id: string;
+  axis: "x" | "y";
+  source: "cell" | "contour";
+  elementId?: string;
+  polygon: Polygon;
+  requiredAs: number;
+  excessAs: number;
+  islandId?: string;
+};
+
+export type AnalysisIsland = {
+  id: string;
+  polygon: Polygon;
+  evidenceCellIds: string[];
+  maxRequiredAsX: number;
+  maxRequiredAsY: number;
+  maxExcessAsX: number;
+  maxExcessAsY: number;
+  evidenceCount: number;
+};
+
+export type ExtraMeshSchedule = {
+  diameter: BaseMeshSettings["diameter"];
+  isAdequate: boolean;
+  shortfall: number;
+  spacing: BaseMeshSettings["spacing"];
+  providedAs: number;
+};
+
+export type ExtraMeshScheduleType = ExtraMeshSchedule & {
+  id: string;
+  axis: "x" | "y";
+  label: string;
+  assignedZoneIds: string[];
+  maxRequiredExtraAs: number;
+};
+
+export type ExtraMeshDesignZone = {
+  id: string;
+  label: string;
+  polygon: Polygon;
+  source: "manual";
+  status: "proposed" | "accepted" | "edited";
+  coveredIslandIds: string[];
+  coveredEvidenceCellIds: string[];
+  direction: "x" | "y" | "both";
+  demand: {
+    maxRequiredAsX: number;
+    maxRequiredAsY: number;
+    requiredExtraAsX: number;
+    requiredExtraAsY: number;
+  };
+  recommendedSchedule?: {
+    x?: ExtraMeshSchedule;
+    y?: ExtraMeshSchedule;
+  };
+  scheduleTypeIds?: {
+    x?: string;
+    y?: string;
+  };
 };
 
 export type StrapExtraMeshZone = {
@@ -183,6 +247,10 @@ export type SlabGeometry = {
   strapLayerY?: DwgUnderlay;
   strapNumericalData?: StrapNumericalData[];
   strapOverloadedElements?: StrapOverloadedElement[];
+  analysisEvidenceCells?: AnalysisEvidenceCell[];
+  analysisIslands?: AnalysisIsland[];
+  extraMeshDesignZones?: ExtraMeshDesignZone[];
+  extraMeshScheduleTypes?: ExtraMeshScheduleType[];
   strapExtraMeshZones?: StrapExtraMeshZone[];
   strapAnalysisDebug?: StrapAnalysisDebug;
   rawDeficitZones?: RawDeficitZone[];

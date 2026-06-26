@@ -12,12 +12,18 @@ import {
 import { mockMeshZones, mockSlabGeometry } from "@/data/mockStructureData";
 import { pointInPolygon } from "@/lib/geometry/clipping";
 import { compareBaseMeshOrientations } from "@/lib/geometry/mesh-sheet-layout";
+import { intersectPolygons } from "@/lib/geometry/polygon-boolean";
 import type {
+  AnalysisEvidenceCell,
+  AnalysisIsland,
   BaseMeshSettings,
   BaseMeshSettingsUpdate,
   CadLineEntity,
   CadTextEntity,
   ExportedReinforcementConfiguration,
+  ExtraMeshDesignZone,
+  ExtraMeshSchedule,
+  ExtraMeshScheduleType,
   MeshZone,
   MeshZoneUpdate,
   Point,
@@ -37,16 +43,7 @@ import type {
 const BASE_CAPACITY = 393;
 const rawDeficitPadding = 450;
 const minimumRawDeficitSize = 900;
-const extraZoneExpansion = 650;
 const extraZoneMergeGap = 650;
-const extraZoneSnap = 250;
-const minimumExtraZoneSize = 1_500;
-const maximumExtraPatchLength = 18_000;
-const maximumExtraPatchDepth = 9_000;
-const maximumExtraStripLength = 12_000;
-const minimumExtraStripLength = 4_000;
-const maximumExtraStripWidth = 3_500;
-const maximumStripSourceWidth = 2_200;
 const contourDeficitInfluence = 650;
 const contourAttachGap = 1_000;
 const contourEdgeTolerance = 2_200;
@@ -54,7 +51,12 @@ const contourEdgeBandLength = 5_000;
 const contourEdgeBandDepth = 1_800;
 
 type DesignAreaDrawingMode = "polygon" | "rectangle";
+type DesignAreaDrawingPurpose = Extract<
+  SlabDesignAreaPurpose,
+  "no-mesh" | "extra-mesh"
+>;
 type StrapLayerAxis = "x" | "y";
+type AnalysisViewMode = "x" | "y" | "both";
 type RawDeficitPoint = Point & {
   requiredAs: number;
 };
@@ -87,9 +89,12 @@ type ReinforcementContextValue = {
   editingDesignAreaId: string | null;
   isDrawingDesignArea: boolean;
   designAreaDrawingMode: DesignAreaDrawingMode | null;
+  designAreaDrawingPurpose: DesignAreaDrawingPurpose;
   boundaryDraftPoints: Point[];
   designAreaDraftPoints: Point[];
   activeDxfUnderlayId: string | null;
+  analysisViewMode: AnalysisViewMode;
+  showRawStrapLayers: boolean;
   beginDrawingZone: () => void;
   cancelDrawingZone: () => void;
   commitDrawnMeshZone: (geometry: MeshZone["geometry"]) => void;
@@ -114,7 +119,10 @@ type ReinforcementContextValue = {
   finishDesignAreaEdit: () => void;
   updateDesignAreaPoint: (areaId: string, index: number, point: Point) => void;
   createMeshZoneForDesignArea: (areaId: string) => boolean;
-  beginDesignAreaDraw: (mode: DesignAreaDrawingMode) => void;
+  beginDesignAreaDraw: (
+    mode: DesignAreaDrawingMode,
+    purpose?: DesignAreaDrawingPurpose
+  ) => void;
   cancelDesignAreaDraw: () => void;
   addDesignAreaDraftPoint: (point: Point) => void;
   finishDesignAreaDraft: () => boolean;
@@ -134,10 +142,13 @@ type ReinforcementContextValue = {
   ) => void;
   setDxfUnderlayScale: (underlayId: string, scale: number) => void;
   translateDxfUnderlay: (underlayId: string, delta: Point) => void;
+  setAnalysisViewMode: (mode: AnalysisViewMode) => void;
+  setShowRawStrapLayers: (visible: boolean) => void;
   setStrapLayer: (axis: StrapLayerAxis, underlay: DwgUnderlay) => void;
   deleteStrapLayer: (axis: StrapLayerAxis) => void;
   setStrapNumericalData: (data: StrapNumericalData[]) => void;
   runThreeWayAnalysis: () => number;
+  clearStrapAnalysis: () => void;
   generateRawDeficitZones: () => number;
   generateSlabFromVisibleLayers: () => boolean;
   activateBaseMeshOnWorkingSlab: (patch?: BaseMeshSettingsUpdate) => boolean;
@@ -265,34 +276,6 @@ function mergeBounds(
   };
 }
 
-function boundsWidth(bounds: ReturnType<typeof boundsFromPolygon>) {
-  return bounds.maxX - bounds.minX;
-}
-
-function boundsHeight(bounds: ReturnType<typeof boundsFromPolygon>) {
-  return bounds.maxY - bounds.minY;
-}
-
-function boundsCanBecomeExtraMeshCandidate(
-  bounds: ReturnType<typeof boundsFromPolygon>
-) {
-  const width = boundsWidth(bounds);
-  const height = boundsHeight(bounds);
-
-  return (
-    Math.max(width, height) <= maximumExtraPatchLength &&
-    Math.min(width, height) <= maximumExtraPatchDepth
-  );
-}
-
-function snapDown(value: number, increment: number) {
-  return Math.floor(value / increment) * increment;
-}
-
-function snapUp(value: number, increment: number) {
-  return Math.ceil(value / increment) * increment;
-}
-
 function rectanglePolygon(bounds: ReturnType<typeof boundsFromPolygon>) {
   return [
     { x: bounds.minX, y: bounds.minY },
@@ -306,15 +289,465 @@ function pointInAnyOpening(point: Point, openings: SlabOpening[]) {
   return openings.some((opening) => pointInPolygon(point, opening.polygon));
 }
 
-function clampBoundsToBounds(
-  bounds: ReturnType<typeof boundsFromPolygon>,
-  clamp: ReturnType<typeof boundsFromPolygon>
+function steelAreaPerMeter(
+  diameter: BaseMeshSettings["diameter"],
+  spacing: BaseMeshSettings["spacing"]
 ) {
+  return (Math.PI * diameter ** 2 * 1_000) / (4 * spacing);
+}
+
+function providedAsForSettings(settings: BaseMeshSettings) {
+  return steelAreaPerMeter(settings.diameter, settings.spacing);
+}
+
+function extraMeshScheduleCatalog() {
+  return ([8, 10, 12] as const).flatMap((diameter) =>
+    ([250, 200, 150] as const).map((spacing) => ({
+      diameter,
+      spacing,
+      providedAs: steelAreaPerMeter(diameter, spacing)
+    }))
+  );
+}
+
+function recommendExtraMeshSchedule(requiredExtraAs: number): ExtraMeshSchedule | undefined {
+  if (requiredExtraAs <= 0) {
+    return undefined;
+  }
+
+  const schedules = extraMeshScheduleCatalog();
+
+  const selectedSchedule =
+    schedules
+      .filter((schedule) => schedule.providedAs >= requiredExtraAs)
+      .toSorted((a, b) => a.providedAs - b.providedAs)[0] ??
+    schedules.toSorted((a, b) => b.providedAs - a.providedAs)[0];
+
   return {
-    maxX: Math.min(bounds.maxX, clamp.maxX),
-    maxY: Math.min(bounds.maxY, clamp.maxY),
-    minX: Math.max(bounds.minX, clamp.minX),
-    minY: Math.max(bounds.minY, clamp.minY)
+    ...selectedSchedule,
+    isAdequate: selectedSchedule.providedAs >= requiredExtraAs,
+    shortfall: Math.max(0, requiredExtraAs - selectedSchedule.providedAs)
+  };
+}
+
+function evidenceCenter(evidence: Pick<AnalysisEvidenceCell, "polygon">) {
+  return polygonCenter(evidence.polygon);
+}
+
+function polygonOverlapArea(first: Polygon, second: Polygon) {
+  return intersectPolygons(first, second).reduce(
+    (area, polygon) => area + polygonAreaAbs(polygon),
+    0
+  );
+}
+
+function polygonsOverlap(first: Polygon, second: Polygon) {
+  return polygonOverlapArea(first, second) > 1;
+}
+
+function maxContourRequiredAsInsidePolygon(
+  underlay: DwgUnderlay | undefined,
+  polygon: Polygon
+) {
+  if (!underlay || underlay.visible === false || polygon.length < 3) {
+    return 0;
+  }
+
+  const visibleLayers = new Set(
+    underlay.layers?.filter((layer) => layer.visible).map((layer) => layer.name) ??
+      []
+  );
+
+  return underlay.texts.reduce((maxRequiredAs, text) => {
+    if (visibleLayers.size > 0 && !visibleLayers.has(text.layer)) {
+      return maxRequiredAs;
+    }
+
+    const requiredAs = parseRequiredSteelValue(text.text);
+
+    if (requiredAs === null) {
+      return maxRequiredAs;
+    }
+
+    const point = transformDxfPoint(underlay, text.position);
+
+    return pointInPolygon(point, polygon)
+      ? Math.max(maxRequiredAs, requiredAs)
+      : maxRequiredAs;
+  }, 0);
+}
+
+function createAnalysisEvidenceCells(
+  overloadedElements: StrapOverloadedElement[],
+  contourDeficitPointsByAxis: Record<StrapLayerAxis, RawDeficitPoint[]>,
+  slabBoundary: Polygon,
+  openings: SlabOpening[],
+  baseProvidedAs: number
+) {
+  const evidenceCells: AnalysisEvidenceCell[] = [];
+
+  const pushEvidence = (
+    evidence: Omit<AnalysisEvidenceCell, "excessAs" | "islandId">
+  ) => {
+    const center = polygonCenter(evidence.polygon);
+
+    if (
+      slabBoundary.length >= 3 &&
+      (!pointInPolygon(center, slabBoundary) || pointInAnyOpening(center, openings))
+    ) {
+      return;
+    }
+
+    evidenceCells.push({
+      ...evidence,
+      excessAs: Math.max(0, evidence.requiredAs - baseProvidedAs)
+    });
+  };
+
+  for (const element of overloadedElements) {
+    pushEvidence({
+      id: `ANALYSIS-CELL-${element.axis}-${element.elementId}-${evidenceCells.length}`,
+      axis: element.axis,
+      elementId: element.elementId,
+      polygon: element.polygon,
+      requiredAs: element.maxRequiredAs,
+      source: "cell"
+    });
+  }
+
+  for (const axis of ["x", "y"] as const) {
+    for (const point of contourDeficitPointsByAxis[axis]) {
+      pushEvidence({
+        id: `ANALYSIS-CONTOUR-${axis}-${evidenceCells.length}`,
+        axis,
+        polygon: rectanglePolygon(contourEvidenceBounds(point, slabBoundary)),
+        requiredAs: point.requiredAs,
+        source: "contour"
+      });
+    }
+  }
+
+  return evidenceCells;
+}
+
+function createAnalysisIslands(evidenceCells: AnalysisEvidenceCell[]) {
+  type EvidenceCluster = {
+    bounds: ReturnType<typeof boundsFromPolygon>;
+    evidence: AnalysisEvidenceCell[];
+  };
+
+  const visited = new Set<number>();
+  const clusters: EvidenceCluster[] = [];
+
+  for (let index = 0; index < evidenceCells.length; index += 1) {
+    if (visited.has(index)) {
+      continue;
+    }
+
+    const stack = [index];
+    const evidence: AnalysisEvidenceCell[] = [];
+    visited.add(index);
+
+    while (stack.length > 0) {
+      const currentIndex = stack.pop();
+
+      if (currentIndex === undefined) {
+        continue;
+      }
+
+      const current = evidenceCells[currentIndex];
+      const currentCenter = evidenceCenter(current);
+      const currentBounds = boundsFromPolygon(current.polygon);
+      evidence.push(current);
+
+      for (let otherIndex = 0; otherIndex < evidenceCells.length; otherIndex += 1) {
+        if (visited.has(otherIndex)) {
+          continue;
+        }
+
+        const other = evidenceCells[otherIndex];
+        const otherCenter = evidenceCenter(other);
+        const otherBounds = boundsFromPolygon(other.polygon);
+        const centersAreClose =
+          Math.hypot(
+            currentCenter.x - otherCenter.x,
+            currentCenter.y - otherCenter.y
+          ) <= contourAttachGap;
+        const boundsAreConnected =
+          boundsOverlapOrNear(currentBounds, otherBounds, extraZoneMergeGap) ||
+          pointDistanceToBounds(currentCenter, otherBounds) <= extraZoneMergeGap ||
+          pointDistanceToBounds(otherCenter, currentBounds) <= extraZoneMergeGap;
+
+        if (centersAreClose || boundsAreConnected) {
+          visited.add(otherIndex);
+          stack.push(otherIndex);
+        }
+      }
+    }
+
+    const bounds = evidence
+      .slice(1)
+      .reduce(
+        (mergedBounds, item) => mergeBounds(mergedBounds, boundsFromPolygon(item.polygon)),
+        boundsFromPolygon(evidence[0].polygon)
+      );
+
+    clusters.push({ bounds, evidence });
+  }
+
+  const islands: AnalysisIsland[] = [];
+  const evidenceWithIslandIds = [...evidenceCells];
+
+  clusters.forEach((cluster, index) => {
+    const id = `ANALYSIS-ISLAND-${index + 1}`;
+    const evidenceCellIds = cluster.evidence.map((evidence) => evidence.id);
+    const maxRequiredAsX = Math.max(
+      0,
+      ...cluster.evidence
+        .filter((evidence) => evidence.axis === "x")
+        .map((evidence) => evidence.requiredAs)
+    );
+    const maxRequiredAsY = Math.max(
+      0,
+      ...cluster.evidence
+        .filter((evidence) => evidence.axis === "y")
+        .map((evidence) => evidence.requiredAs)
+    );
+    const maxExcessAsX = Math.max(
+      0,
+      ...cluster.evidence
+        .filter((evidence) => evidence.axis === "x")
+        .map((evidence) => evidence.excessAs)
+    );
+    const maxExcessAsY = Math.max(
+      0,
+      ...cluster.evidence
+        .filter((evidence) => evidence.axis === "y")
+        .map((evidence) => evidence.excessAs)
+    );
+
+    islands.push({
+      id,
+      evidenceCellIds,
+      evidenceCount: evidenceCellIds.length,
+      maxExcessAsX,
+      maxExcessAsY,
+      maxRequiredAsX,
+      maxRequiredAsY,
+      polygon: rectanglePolygon(cluster.bounds)
+    });
+
+    for (const evidenceId of evidenceCellIds) {
+      const evidenceIndex = evidenceWithIslandIds.findIndex(
+        (evidence) => evidence.id === evidenceId
+      );
+
+      if (evidenceIndex >= 0) {
+        evidenceWithIslandIds[evidenceIndex] = {
+          ...evidenceWithIslandIds[evidenceIndex],
+          islandId: id
+        };
+      }
+    }
+  });
+
+  return { evidenceCells: evidenceWithIslandIds, islands };
+}
+
+function calculateExtraMeshDesignZone(
+  polygon: Polygon,
+  slabGeometry: SlabGeometry,
+  baseParameters: BaseMeshSettings,
+  index: number,
+  existing?: ExtraMeshDesignZone
+): ExtraMeshDesignZone {
+  const baseProvidedAs = providedAsForSettings(baseParameters);
+  const coveredEvidence = (slabGeometry.analysisEvidenceCells ?? []).filter((evidence) =>
+    pointInPolygon(evidenceCenter(evidence), polygon) ||
+    polygonsOverlap(evidence.polygon, polygon)
+  );
+  const contourMaxRequiredAsX = maxContourRequiredAsInsidePolygon(
+    slabGeometry.strapLayerX,
+    polygon
+  );
+  const contourMaxRequiredAsY = maxContourRequiredAsInsidePolygon(
+    slabGeometry.strapLayerY,
+    polygon
+  );
+  const coveredIslandIds = [
+    ...new Set(
+      [
+        ...(contourMaxRequiredAsX > baseProvidedAs ? ["CONTOUR-X"] : []),
+        ...(contourMaxRequiredAsY > baseProvidedAs ? ["CONTOUR-Y"] : []),
+        ...(slabGeometry.analysisIslands ?? [])
+          .filter((island) => polygonsOverlap(island.polygon, polygon))
+          .map((island) => island.id),
+        ...coveredEvidence
+          .map((evidence) => evidence.islandId)
+          .filter((islandId): islandId is string => Boolean(islandId))
+      ]
+    )
+  ];
+  const maxRequiredAsX = Math.max(
+    0,
+    contourMaxRequiredAsX,
+    ...coveredEvidence
+      .filter((evidence) => evidence.axis === "x")
+      .map((evidence) => evidence.requiredAs)
+  );
+  const maxRequiredAsY = Math.max(
+    0,
+    contourMaxRequiredAsY,
+    ...coveredEvidence
+      .filter((evidence) => evidence.axis === "y")
+      .map((evidence) => evidence.requiredAs)
+  );
+  const requiredExtraAsX = Math.max(0, maxRequiredAsX - baseProvidedAs);
+  const requiredExtraAsY = Math.max(0, maxRequiredAsY - baseProvidedAs);
+  const direction =
+    requiredExtraAsX > 0 && requiredExtraAsY > 0
+      ? "both"
+      : requiredExtraAsX >= requiredExtraAsY
+        ? "x"
+        : "y";
+  const recommendedSchedule: ExtraMeshDesignZone["recommendedSchedule"] = {};
+  const xSchedule = recommendExtraMeshSchedule(requiredExtraAsX);
+  const ySchedule = recommendExtraMeshSchedule(requiredExtraAsY);
+
+  if (xSchedule) {
+    recommendedSchedule.x = xSchedule;
+  }
+  if (ySchedule) {
+    recommendedSchedule.y = ySchedule;
+  }
+
+  return {
+    id: existing?.id ?? `EXTRA-MESH-DESIGN-${index + 1}`,
+    label: existing?.label ?? `Extra mesh zone - ${index + 1}`,
+    polygon,
+    source: "manual",
+    status: existing?.status === "accepted" ? "edited" : (existing?.status ?? "proposed"),
+    coveredIslandIds,
+    coveredEvidenceCellIds: coveredEvidence.map((evidence) => evidence.id),
+    direction,
+    demand: {
+      maxRequiredAsX,
+      maxRequiredAsY,
+      requiredExtraAsX,
+      requiredExtraAsY
+    },
+    recommendedSchedule:
+      recommendedSchedule.x || recommendedSchedule.y ? recommendedSchedule : undefined
+  };
+}
+
+function createScheduleType(
+  axis: "x" | "y",
+  index: number,
+  requiredExtraAs: number,
+  assignedZoneIds: string[]
+): ExtraMeshScheduleType {
+  const schedule = recommendExtraMeshSchedule(requiredExtraAs) ?? {
+    diameter: 8 as const,
+    isAdequate: true,
+    providedAs: 0,
+    shortfall: 0,
+    spacing: 250 as const
+  };
+  const label = `${axis.toUpperCase()}-${String.fromCharCode(65 + index)}`;
+
+  return {
+    ...schedule,
+    axis,
+    assignedZoneIds,
+    id: `EXTRA-SCHEDULE-${axis.toUpperCase()}-${index + 1}`,
+    label,
+    maxRequiredExtraAs: requiredExtraAs
+  };
+}
+
+function standardizeExtraMeshSchedules(zones: ExtraMeshDesignZone[]) {
+  const scheduleTypes: ExtraMeshScheduleType[] = [];
+  const zoneById = new Map<string, ExtraMeshDesignZone>(
+    zones.map((zone) => [
+      zone.id,
+      {
+        ...zone,
+        recommendedSchedule: undefined,
+        scheduleTypeIds: undefined
+      }
+    ])
+  );
+
+  for (const axis of ["x", "y"] as const) {
+    const demandField =
+      axis === "x" ? "requiredExtraAsX" : "requiredExtraAsY";
+    const zoneDemands = zones
+      .map((zone) => ({
+        demand: zone.demand[demandField],
+        zone
+      }))
+      .filter(({ demand }) => demand > 0)
+      .toSorted((a, b) => a.demand - b.demand);
+
+    if (zoneDemands.length === 0) {
+      continue;
+    }
+
+    const maxDemand = zoneDemands.at(-1)?.demand ?? 0;
+    const lightCandidates = zoneDemands.filter(
+      ({ demand }) => demand <= maxDemand * 0.65
+    );
+    const groups =
+      lightCandidates.length > 0 && lightCandidates.length < zoneDemands.length
+        ? [
+            lightCandidates,
+            zoneDemands.filter(({ demand }) => demand > maxDemand * 0.65)
+          ]
+        : [zoneDemands];
+
+    groups.forEach((group) => {
+      const groupMaxDemand = Math.max(...group.map(({ demand }) => demand));
+      const assignedZoneIds = group.map(({ zone }) => zone.id);
+      const scheduleType = createScheduleType(
+        axis,
+        scheduleTypes.filter((type) => type.axis === axis).length,
+        groupMaxDemand,
+        assignedZoneIds
+      );
+
+      scheduleTypes.push(scheduleType);
+      for (const zoneId of assignedZoneIds) {
+        const zone = zoneById.get(zoneId);
+
+        if (!zone) {
+          continue;
+        }
+
+        zoneById.set(zoneId, {
+          ...zone,
+          recommendedSchedule: {
+            ...(zone.recommendedSchedule ?? {}),
+            [axis]: {
+              diameter: scheduleType.diameter,
+              isAdequate: scheduleType.isAdequate,
+              providedAs: scheduleType.providedAs,
+              shortfall: Math.max(0, zone.demand[demandField] - scheduleType.providedAs),
+              spacing: scheduleType.spacing
+            }
+          },
+          scheduleTypeIds: {
+            ...(zone.scheduleTypeIds ?? {}),
+            [axis]: scheduleType.id
+          }
+        });
+      }
+    });
+  }
+
+  return {
+    scheduleTypes,
+    zones: zones.map((zone) => zoneById.get(zone.id) ?? zone)
   };
 }
 
@@ -839,256 +1272,6 @@ function collectOverloadedElementsFromCells(
   }, []);
 }
 
-function createExtraMeshZonesFromOverloads(
-  overloadedElements: StrapOverloadedElement[],
-  contourDeficitPoints: RawDeficitPoint[],
-  slabBoundary: Polygon,
-  openings: SlabOpening[]
-): StrapExtraMeshZone[] {
-  type ExtraMeshEvidence = {
-    bounds: ReturnType<typeof boundsFromPolygon>;
-    center: Point;
-    contourPointCount: number;
-    overloadedElementCount: number;
-    maxRequiredAs: number;
-  };
-
-  const slabBounds = slabBoundary.length >= 3 ? boundsFromPolygon(slabBoundary) : null;
-  const evidenceItems: ExtraMeshEvidence[] = [];
-
-  const addEvidenceItem = (
-    bounds: ReturnType<typeof boundsFromPolygon>,
-    center: Point,
-    maxRequiredAs: number,
-    evidence: "cell" | "contour"
-  ) => {
-    const isInsideRelevantSlabArea =
-      evidence === "contour"
-        ? pointInOrNearPolygon(center, slabBoundary, contourEdgeTolerance)
-        : pointInPolygon(center, slabBoundary);
-
-    if (
-      slabBoundary.length >= 3 &&
-      (!isInsideRelevantSlabArea || pointInAnyOpening(center, openings))
-    ) {
-      return;
-    }
-
-    evidenceItems.push({
-      bounds,
-      center,
-      contourPointCount: evidence === "contour" ? 1 : 0,
-      overloadedElementCount: evidence === "cell" ? 1 : 0,
-      maxRequiredAs
-    });
-  };
-
-  for (const element of overloadedElements) {
-    const center = polygonCenter(element.polygon);
-    addEvidenceItem(
-      boundsFromPolygon(element.polygon),
-      center,
-      element.maxRequiredAs,
-      "cell"
-    );
-  }
-
-  for (const point of contourDeficitPoints) {
-    addEvidenceItem(
-      contourEvidenceBounds(point, slabBoundary),
-      point,
-      point.requiredAs,
-      "contour"
-    );
-  }
-
-  const visited = new Set<number>();
-  const islandClusters: ExtraMeshEvidence[] = [];
-
-  for (let index = 0; index < evidenceItems.length; index += 1) {
-    if (visited.has(index)) {
-      continue;
-    }
-
-    const stack = [index];
-    const component: ExtraMeshEvidence[] = [];
-    visited.add(index);
-
-    while (stack.length > 0) {
-      const currentIndex = stack.pop();
-
-      if (currentIndex === undefined) {
-        continue;
-      }
-
-      const current = evidenceItems[currentIndex];
-      component.push(current);
-
-      for (let otherIndex = 0; otherIndex < evidenceItems.length; otherIndex += 1) {
-        if (visited.has(otherIndex)) {
-          continue;
-        }
-
-        const other = evidenceItems[otherIndex];
-        const centersAreClose =
-          Math.hypot(
-            current.center.x - other.center.x,
-            current.center.y - other.center.y
-          ) <= contourAttachGap;
-        const boundsAreConnected =
-          boundsOverlapOrNear(current.bounds, other.bounds, extraZoneMergeGap) ||
-          pointDistanceToBounds(current.center, other.bounds) <= extraZoneMergeGap ||
-          pointDistanceToBounds(other.center, current.bounds) <= extraZoneMergeGap;
-
-        if (centersAreClose || boundsAreConnected) {
-          visited.add(otherIndex);
-          stack.push(otherIndex);
-        }
-      }
-    }
-
-    const cluster = component.slice(1).reduce<ExtraMeshEvidence>(
-      (mergedCluster, item) => ({
-        bounds: mergeBounds(mergedCluster.bounds, item.bounds),
-        center: {
-          x: (mergedCluster.center.x + item.center.x) / 2,
-          y: (mergedCluster.center.y + item.center.y) / 2
-        },
-        contourPointCount:
-          mergedCluster.contourPointCount + item.contourPointCount,
-        overloadedElementCount:
-          mergedCluster.overloadedElementCount + item.overloadedElementCount,
-        maxRequiredAs: Math.max(mergedCluster.maxRequiredAs, item.maxRequiredAs)
-      }),
-      component[0]
-    );
-
-    islandClusters.push(cluster);
-  }
-
-  const mergeFinalIslandClusters = (clusters: ExtraMeshEvidence[]) => {
-    const merged = [...clusters];
-    let didMerge = true;
-
-    while (didMerge) {
-      didMerge = false;
-
-      for (let index = 0; index < merged.length; index += 1) {
-        for (let otherIndex = index + 1; otherIndex < merged.length; otherIndex += 1) {
-          const combinedBounds = mergeBounds(
-            merged[index].bounds,
-            merged[otherIndex].bounds
-          );
-
-          if (
-            boundsOverlapOrNear(
-              merged[index].bounds,
-              merged[otherIndex].bounds,
-              extraZoneMergeGap
-            ) &&
-            boundsCanBecomeExtraMeshCandidate(combinedBounds)
-          ) {
-            merged[index] = {
-              bounds: combinedBounds,
-              center: {
-                x: (merged[index].center.x + merged[otherIndex].center.x) / 2,
-                y: (merged[index].center.y + merged[otherIndex].center.y) / 2
-              },
-              contourPointCount:
-                merged[index].contourPointCount +
-                merged[otherIndex].contourPointCount,
-              overloadedElementCount:
-                merged[index].overloadedElementCount +
-                merged[otherIndex].overloadedElementCount,
-              maxRequiredAs: Math.max(
-                merged[index].maxRequiredAs,
-                merged[otherIndex].maxRequiredAs
-              )
-            };
-            merged.splice(otherIndex, 1);
-            didMerge = true;
-            break;
-          }
-        }
-
-        if (didMerge) {
-          break;
-        }
-      }
-    }
-
-    return merged;
-  };
-
-  return mergeFinalIslandClusters(islandClusters).map((cluster, index) => {
-    const centerX = (cluster.bounds.minX + cluster.bounds.maxX) / 2;
-    const centerY = (cluster.bounds.minY + cluster.bounds.maxY) / 2;
-    const rawWidth = boundsWidth(cluster.bounds);
-    const rawHeight = boundsHeight(cluster.bounds);
-    const aspectRatio =
-      Math.max(rawWidth, rawHeight) / Math.max(1, Math.min(rawWidth, rawHeight));
-    const minorDimension = Math.min(rawWidth, rawHeight);
-    const shouldCreateStrip =
-      aspectRatio >= 1.75 &&
-      Math.max(rawWidth, rawHeight) >= minimumExtraStripLength * 0.65 &&
-      Math.max(rawWidth, rawHeight) <= maximumExtraStripLength &&
-      minorDimension <= maximumStripSourceWidth;
-    const orientation =
-      shouldCreateStrip && rawWidth >= rawHeight ? "horizontal" : "vertical";
-    const width = shouldCreateStrip
-      ? orientation === "horizontal"
-        ? Math.min(
-            maximumExtraStripLength,
-            Math.max(minimumExtraStripLength, rawWidth + extraZoneExpansion * 2)
-          )
-        : Math.min(
-            maximumExtraStripWidth,
-            Math.max(minimumExtraZoneSize, rawWidth + extraZoneExpansion * 2)
-          )
-      : Math.min(
-          rawWidth >= rawHeight ? maximumExtraPatchLength : maximumExtraPatchDepth,
-          Math.max(minimumExtraZoneSize, rawWidth + extraZoneExpansion * 2)
-        );
-    const height = shouldCreateStrip
-      ? orientation === "horizontal"
-        ? Math.min(
-            maximumExtraStripWidth,
-            Math.max(minimumExtraZoneSize, rawHeight + extraZoneExpansion * 2)
-          )
-        : Math.min(
-            maximumExtraStripLength,
-            Math.max(minimumExtraStripLength, rawHeight + extraZoneExpansion * 2)
-          )
-      : Math.min(
-          rawHeight >= rawWidth ? maximumExtraPatchLength : maximumExtraPatchDepth,
-          Math.max(minimumExtraZoneSize, rawHeight + extraZoneExpansion * 2)
-        );
-    const expandedBounds = {
-      maxX: snapUp(centerX + width / 2, extraZoneSnap),
-      maxY: snapUp(centerY + height / 2, extraZoneSnap),
-      minX: snapDown(centerX - width / 2, extraZoneSnap),
-      minY: snapDown(centerY - height / 2, extraZoneSnap)
-    };
-    const finalBounds = slabBounds
-      ? clampBoundsToBounds(expandedBounds, slabBounds)
-      : expandedBounds;
-
-    return {
-      id: `STRAP-EXTRA-ZONE-${index + 1}`,
-      label: shouldCreateStrip
-        ? `Extra Mesh Strip ${index + 1}`
-        : `Extra Mesh Patch ${index + 1}`,
-      kind: shouldCreateStrip ? "strip" : "patch",
-      orientation: shouldCreateStrip ? orientation : undefined,
-      polygon: rectanglePolygon(finalBounds),
-      contourPointCount: cluster.contourPointCount,
-      overloadedElementCount: cluster.overloadedElementCount,
-      maxRequiredAs: cluster.maxRequiredAs,
-      recommendedExtraAs: Math.max(0, cluster.maxRequiredAs - BASE_CAPACITY)
-    };
-  });
-}
-
 function collectOverloadedElementsFromLayer(
   axis: StrapLayerAxis,
   underlay: DwgUnderlay | undefined,
@@ -1372,6 +1555,9 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
   const [activeDxfUnderlayId, setActiveDxfUnderlayId] = useState<string | null>(
     null
   );
+  const [analysisViewMode, setAnalysisViewMode] =
+    useState<AnalysisViewMode>("both");
+  const [showRawStrapLayers, setShowRawStrapLayers] = useState(false);
   const [selectedDesignAreaId, setSelectedDesignAreaId] = useState<string | null>(
     null
   );
@@ -1384,6 +1570,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
   const [isDrawingDesignArea, setIsDrawingDesignArea] = useState(false);
   const [designAreaDrawingMode, setDesignAreaDrawingMode] =
     useState<DesignAreaDrawingMode | null>(null);
+  const [designAreaDrawingPurpose, setDesignAreaDrawingPurpose] =
+    useState<DesignAreaDrawingPurpose>("no-mesh");
   const [boundaryDraftPoints, setBoundaryDraftPoints] = useState<Point[]>([]);
   const [designAreaDraftPoints, setDesignAreaDraftPoints] = useState<Point[]>([]);
   const activeMeshZone =
@@ -1428,6 +1616,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setIsDrawingZone(true);
     setIsDrawingDesignArea(false);
     setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
   }, []);
 
@@ -1458,6 +1647,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setIsDrawingBoundary(true);
     setIsDrawingDesignArea(false);
     setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
     setIsDrawingZone(false);
   }, []);
@@ -1471,9 +1661,13 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setBoundaryDraftPoints((current) => [...current, point]);
   }, []);
 
-  const beginDesignAreaDraw = useCallback((mode: DesignAreaDrawingMode) => {
+  const beginDesignAreaDraw = useCallback((
+    mode: DesignAreaDrawingMode,
+    purpose: DesignAreaDrawingPurpose = "no-mesh"
+  ) => {
     setDesignAreaDraftPoints([]);
     setDesignAreaDrawingMode(mode);
+    setDesignAreaDrawingPurpose(purpose);
     setIsDrawingDesignArea(true);
     setIsDrawingBoundary(false);
     setIsEditingBoundary(false);
@@ -1484,6 +1678,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
   const cancelDesignAreaDraw = useCallback(() => {
     setDesignAreaDraftPoints([]);
     setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
     setIsDrawingDesignArea(false);
   }, []);
 
@@ -1540,33 +1735,54 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setIsEditingBoundary(false);
     setIsDrawingDesignArea(false);
     setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
     setIsDrawingZone(false);
     return true;
   }, [activeMeshZone.parameters, boundaryDraftPoints, slabGeometry]);
 
   const commitDesignAreaPolygon = useCallback(
-    (polygon: Point[]) => {
+    (polygon: Point[], purpose: SlabDesignAreaPurpose = designAreaDrawingPurpose) => {
       if (!slabGeometry.hasActiveSlabBoundary || polygon.length < 3) {
         return false;
       }
 
       const designAreas = slabGeometry.designAreas ?? [];
       const areaIndex = designAreas.length + 1;
+      const areaId = `AREA-${String(areaIndex).padStart(2, "0")}`;
+      const isExtraMeshArea = purpose === "extra-mesh";
+      const nextExtraMeshDesignZone = isExtraMeshArea
+        ? calculateExtraMeshDesignZone(
+            polygon,
+            slabGeometry,
+            activeMeshZone.parameters,
+            slabGeometry.extraMeshDesignZones?.length ?? 0
+          )
+        : null;
+      const standardizedExtraMesh = standardizeExtraMeshSchedules(
+        nextExtraMeshDesignZone
+          ? [...(slabGeometry.extraMeshDesignZones ?? []), nextExtraMeshDesignZone]
+          : (slabGeometry.extraMeshDesignZones ?? [])
+      );
       const nextSlabGeometry: SlabGeometry = {
         ...slabGeometry,
         designAreas: [
           ...designAreas,
           {
-            id: `AREA-${String(areaIndex).padStart(2, "0")}`,
-            label: `No mesh area - ${areaIndex}`,
+            id: areaId,
+            label: isExtraMeshArea
+              ? `Extra mesh area - ${areaIndex}`
+              : `No mesh area - ${areaIndex}`,
+            extraMeshDesignZoneId: nextExtraMeshDesignZone?.id,
             polygon,
             priority: areaIndex,
-            purpose: "no-mesh",
+            purpose,
             source: "user",
             visible: true
           }
-        ]
+        ],
+        extraMeshDesignZones: standardizedExtraMesh.zones,
+        extraMeshScheduleTypes: standardizedExtraMesh.scheduleTypes
       };
       const nextMainZone = createMainZoneForSlab(
         nextSlabGeometry,
@@ -1579,17 +1795,19 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
         ...current.filter((zone) => !zone.isMainZone)
       ]);
       setActiveZoneId(nextMainZone.id);
+      setSelectedDesignAreaId(areaId);
       setDesignAreaDraftPoints([]);
       setDesignAreaDrawingMode(null);
+      setDesignAreaDrawingPurpose("no-mesh");
       setIsDrawingDesignArea(false);
       return true;
     },
-    [activeMeshZone.parameters, slabGeometry]
+    [activeMeshZone.parameters, designAreaDrawingPurpose, slabGeometry]
   );
 
   const finishDesignAreaDraft = useCallback(() => {
-    return commitDesignAreaPolygon(designAreaDraftPoints);
-  }, [commitDesignAreaPolygon, designAreaDraftPoints]);
+    return commitDesignAreaPolygon(designAreaDraftPoints, designAreaDrawingPurpose);
+  }, [commitDesignAreaPolygon, designAreaDraftPoints, designAreaDrawingPurpose]);
 
   const beginBoundaryEdit = useCallback(() => {
     if (!slabGeometry.hasActiveSlabBoundary) {
@@ -1600,6 +1818,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setIsDrawingBoundary(false);
     setIsDrawingDesignArea(false);
     setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
     setIsDrawingZone(false);
     setBoundaryDraftPoints([]);
@@ -1641,21 +1860,37 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       const meshZoneIdToRemove = purposeRemovesAreaMesh(purpose)
         ? currentArea.meshZoneId
         : undefined;
+      const extraMeshDesignZoneIdToRemove =
+        purpose !== "extra-mesh" ? currentArea.extraMeshDesignZoneId : undefined;
 
-      setSlabGeometry((current) => ({
-        ...current,
-        designAreas: (current.designAreas ?? []).map((area) =>
-          area.id === areaId
-            ? {
-                ...area,
-                meshZoneId: purposeRemovesAreaMesh(purpose)
-                  ? undefined
-                  : nextMeshZone?.id ?? area.meshZoneId,
-                purpose
-              }
-            : area
-        )
-      }));
+      setSlabGeometry((current) => {
+        const nextExtraMeshZones = extraMeshDesignZoneIdToRemove
+          ? (current.extraMeshDesignZones ?? []).filter(
+              (zone) => zone.id !== extraMeshDesignZoneIdToRemove
+            )
+          : (current.extraMeshDesignZones ?? []);
+        const standardizedExtraMesh =
+          standardizeExtraMeshSchedules(nextExtraMeshZones);
+
+        return {
+          ...current,
+          designAreas: (current.designAreas ?? []).map((area) =>
+            area.id === areaId
+              ? {
+                  ...area,
+                  meshZoneId: purposeRemovesAreaMesh(purpose)
+                    ? undefined
+                    : nextMeshZone?.id ?? area.meshZoneId,
+                  extraMeshDesignZoneId:
+                    purpose === "extra-mesh" ? area.extraMeshDesignZoneId : undefined,
+                  purpose
+                }
+              : area
+          ),
+          extraMeshDesignZones: standardizedExtraMesh.zones,
+          extraMeshScheduleTypes: standardizedExtraMesh.scheduleTypes
+        };
+      });
       setMeshZones((current) => {
         const retainedZones = meshZoneIdToRemove
           ? current.filter((zone) => zone.id !== meshZoneIdToRemove)
@@ -1678,16 +1913,30 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
 
   const deleteDesignArea = useCallback(
     (areaId: string) => {
-      const linkedMeshZoneId = (slabGeometry.designAreas ?? []).find(
+      const deletedArea = (slabGeometry.designAreas ?? []).find(
         (area) => area.id === areaId
-      )?.meshZoneId;
+      );
+      const linkedMeshZoneId = deletedArea?.meshZoneId;
+      const linkedExtraMeshDesignZoneId = deletedArea?.extraMeshDesignZoneId;
 
-      setSlabGeometry((current) => ({
-        ...current,
-        designAreas: (current.designAreas ?? []).filter(
-          (area) => area.id !== areaId
-        )
-      }));
+      setSlabGeometry((current) => {
+        const nextExtraMeshZones = linkedExtraMeshDesignZoneId
+          ? (current.extraMeshDesignZones ?? []).filter(
+              (zone) => zone.id !== linkedExtraMeshDesignZoneId
+            )
+          : (current.extraMeshDesignZones ?? []);
+        const standardizedExtraMesh =
+          standardizeExtraMeshSchedules(nextExtraMeshZones);
+
+        return {
+          ...current,
+          designAreas: (current.designAreas ?? []).filter(
+            (area) => area.id !== areaId
+          ),
+          extraMeshDesignZones: standardizedExtraMesh.zones,
+          extraMeshScheduleTypes: standardizedExtraMesh.scheduleTypes
+        };
+      });
       if (linkedMeshZoneId) {
         setMeshZones((current) =>
           current.filter((zone) => zone.id !== linkedMeshZoneId)
@@ -1709,6 +1958,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setIsDrawingBoundary(false);
     setIsDrawingDesignArea(false);
     setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
     setIsDrawingZone(false);
   }, []);
@@ -1720,16 +1970,34 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
   const updateDesignAreaPoint = useCallback(
     (areaId: string, index: number, point: Point) => {
       setSlabGeometry((current) => {
+        let recalculatedExtraMeshZone: ExtraMeshDesignZone | null = null;
         const nextSlabGeometry = {
           ...current,
           designAreas: (current.designAreas ?? []).map((area) =>
             area.id === areaId
-              ? {
-                  ...area,
-                  polygon: area.polygon.map((areaPoint, pointIndex) =>
+              ? (() => {
+                  const polygon = area.polygon.map((areaPoint, pointIndex) =>
                     pointIndex === index ? point : areaPoint
-                  )
-                }
+                  );
+                  const linkedExtraMeshZone = (current.extraMeshDesignZones ?? []).find(
+                    (zone) => zone.id === area.extraMeshDesignZoneId
+                  );
+
+                  if (linkedExtraMeshZone) {
+                    recalculatedExtraMeshZone = calculateExtraMeshDesignZone(
+                      polygon,
+                      current,
+                      activeMeshZone.parameters,
+                      current.extraMeshDesignZones?.length ?? 0,
+                      linkedExtraMeshZone
+                    );
+                  }
+
+                  return {
+                    ...area,
+                    polygon
+                  };
+                })()
               : area
           )
         };
@@ -1744,10 +2012,26 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
           })
         );
 
-        return nextSlabGeometry;
+        if (!recalculatedExtraMeshZone) {
+          return nextSlabGeometry;
+        }
+
+        const standardizedExtraMesh = standardizeExtraMeshSchedules(
+          (nextSlabGeometry.extraMeshDesignZones ?? []).map((zone) =>
+            zone.id === recalculatedExtraMeshZone?.id
+              ? recalculatedExtraMeshZone
+              : zone
+          )
+        );
+
+        return {
+          ...nextSlabGeometry,
+          extraMeshDesignZones: standardizedExtraMesh.zones,
+          extraMeshScheduleTypes: standardizedExtraMesh.scheduleTypes
+        };
       });
     },
-    []
+    [activeMeshZone.parameters]
   );
 
   const createMeshZoneForDesignArea = useCallback(
@@ -1888,6 +2172,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setIsEditingBoundary(false);
     setIsDrawingDesignArea(false);
     setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
     setIsDrawingZone(false);
     return true;
@@ -1910,6 +2195,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setIsEditingBoundary(false);
     setIsDrawingDesignArea(false);
     setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
     setBoundaryDraftPoints([]);
   }, []);
@@ -1953,6 +2239,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       setIsEditingBoundary(false);
       setIsDrawingDesignArea(false);
       setDesignAreaDrawingMode(null);
+      setDesignAreaDrawingPurpose("no-mesh");
       setDesignAreaDraftPoints([]);
       setBoundaryDraftPoints([]);
     },
@@ -1968,6 +2255,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       dxfUnderlays: [...(current.dxfUnderlays ?? []), nextUnderlay]
     }));
     setActiveDxfUnderlayId(nextUnderlay.id ?? null);
+    setShowRawStrapLayers(true);
   }, []);
 
   const deleteDxfUnderlayById = useCallback((underlayId: string) => {
@@ -2144,6 +2432,10 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setSlabGeometry((current) => ({
       ...current,
       strapNumericalData: data,
+      analysisEvidenceCells: [],
+      analysisIslands: [],
+      extraMeshDesignZones: [],
+      extraMeshScheduleTypes: [],
       strapExtraMeshZones: [],
       strapOverloadedElements: [],
       strapAnalysisDebug: undefined
@@ -2216,17 +2508,26 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
         : shouldUseSequentialMapping
           ? sequentialElements
           : [...polygonOverloadedElements, ...directLabelFallbackElements];
+    const contourDeficitPointsByAxis = {
+      x: collectRawDeficitPoints(slabGeometry.strapLayerX, slabGeometry.boundary),
+      y: collectRawDeficitPoints(slabGeometry.strapLayerY, slabGeometry.boundary)
+    };
     const contourDeficitPoints = [
-      ...collectRawDeficitPoints(slabGeometry.strapLayerX, slabGeometry.boundary),
-      ...collectRawDeficitPoints(slabGeometry.strapLayerY, slabGeometry.boundary)
+      ...contourDeficitPointsByAxis.x,
+      ...contourDeficitPointsByAxis.y
     ];
-    const strapExtraMeshZones =
-      createExtraMeshZonesFromOverloads(
+    const baseParameters =
+      meshZones.find((zone) => zone.isMainZone)?.parameters ?? activeMeshZone.parameters;
+    const analysis = createAnalysisIslands(
+      createAnalysisEvidenceCells(
         strapOverloadedElements,
-        contourDeficitPoints,
+        contourDeficitPointsByAxis,
         slabGeometry.boundary,
-        slabGeometry.openings
-      );
+        slabGeometry.openings,
+        providedAsForSettings(baseParameters)
+      )
+    );
+    const strapExtraMeshZones: StrapExtraMeshZone[] = [];
     const maxCsvRequiredAs = Math.max(
       0,
       ...(slabGeometry.strapNumericalData ?? []).map((row) => row.maxRequiredAs)
@@ -2244,7 +2545,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
         (slabGeometry.strapLayerY?.closedPolylines?.length ?? 0),
       overloadedElements: strapOverloadedElements.length,
       contourDeficitPoints: contourDeficitPoints.length,
-      extraMeshZones: strapExtraMeshZones.length,
+      extraMeshZones: analysis.islands.length,
       elementCellCandidates: elementCells.length,
       sampleCsvElementIds: [...numericalDataByElement.keys()].slice(0, 8),
       sampleDxfElementIds: [...dxfIds].slice(0, 8),
@@ -2263,10 +2564,14 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
 
     setSlabGeometry((current) => ({
       ...current,
+      analysisEvidenceCells: analysis.evidenceCells,
+      analysisIslands: analysis.islands,
       strapExtraMeshZones,
       strapOverloadedElements,
       strapAnalysisDebug
     }));
+    setAnalysisViewMode("both");
+    setShowRawStrapLayers(true);
 
     return strapOverloadedElements.length;
   }, [
@@ -2274,8 +2579,43 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     slabGeometry.strapLayerX,
     slabGeometry.strapLayerY,
     slabGeometry.strapNumericalData,
-    slabGeometry.openings
+    slabGeometry.openings,
+    activeMeshZone.parameters,
+    meshZones
   ]);
+
+  const clearStrapAnalysis = useCallback(() => {
+    const extraMeshAreaIds = new Set(
+      (slabGeometry.designAreas ?? [])
+        .filter((area) => area.purpose === "extra-mesh")
+        .map((area) => area.id)
+    );
+
+    setSlabGeometry((current) => ({
+      ...current,
+      analysisEvidenceCells: [],
+      analysisIslands: [],
+      extraMeshDesignZones: [],
+      extraMeshScheduleTypes: [],
+      rawDeficitZones: [],
+      strapAnalysisDebug: undefined,
+      strapExtraMeshZones: [],
+      strapOverloadedElements: [],
+      designAreas: (current.designAreas ?? []).filter(
+        (area) => area.purpose !== "extra-mesh"
+      )
+    }));
+    setSelectedDesignAreaId((current) =>
+      current && extraMeshAreaIds.has(current) ? null : current
+    );
+    setEditingDesignAreaId((current) =>
+      current && extraMeshAreaIds.has(current) ? null : current
+    );
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
+    setDesignAreaDraftPoints([]);
+  }, [slabGeometry.designAreas]);
 
   const generateRawDeficitZones = useCallback(() => {
     const deficitPoints = [
@@ -2346,6 +2686,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setIsEditingBoundary(false);
     setIsDrawingDesignArea(false);
     setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
     setBoundaryDraftPoints([]);
     return true;
@@ -2385,6 +2726,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setIsEditingBoundary(false);
     setIsDrawingDesignArea(false);
     setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
     setBoundaryDraftPoints([]);
     return true;
@@ -2427,6 +2769,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setIsEditingBoundary(false);
     setIsDrawingDesignArea(false);
     setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
     setBoundaryDraftPoints([]);
   }, []);
@@ -2455,9 +2798,12 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       editingDesignAreaId,
       isDrawingDesignArea,
       designAreaDrawingMode,
+      designAreaDrawingPurpose,
       boundaryDraftPoints,
       designAreaDraftPoints,
       activeDxfUnderlayId,
+      analysisViewMode,
+      showRawStrapLayers,
       beginDrawingZone,
       cancelDrawingZone,
       commitDrawnMeshZone,
@@ -2473,6 +2819,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       deleteDxfUnderlay,
       deleteStrapLayer,
       runThreeWayAnalysis,
+      clearStrapAnalysis,
       setSelectedDesignAreaId,
       setDesignAreaVisible,
       updateDesignAreaPurpose,
@@ -2497,6 +2844,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       setDxfUnderlayLayerVisible,
       setDxfUnderlayScale,
       setDxfUnderlayVisible,
+      setAnalysisViewMode,
+      setShowRawStrapLayers,
       setStrapLayer,
       setStrapNumericalData,
       setUnderlayLayerVisible,
@@ -2518,9 +2867,12 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       editingDesignAreaId,
       isDrawingDesignArea,
       designAreaDrawingMode,
+      designAreaDrawingPurpose,
       boundaryDraftPoints,
       designAreaDraftPoints,
       activeDxfUnderlayId,
+      analysisViewMode,
+      showRawStrapLayers,
       beginDrawingZone,
       cancelDrawingZone,
       commitDrawnMeshZone,
@@ -2536,6 +2888,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       deleteDxfUnderlay,
       deleteStrapLayer,
       runThreeWayAnalysis,
+      clearStrapAnalysis,
       setSelectedDesignAreaId,
       setDesignAreaVisible,
       updateDesignAreaPurpose,
@@ -2560,6 +2913,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       setDxfUnderlayLayerVisible,
       setDxfUnderlayScale,
       setDxfUnderlayVisible,
+      setAnalysisViewMode,
+      setShowRawStrapLayers,
       setStrapLayer,
       setStrapNumericalData,
       translateDxfUnderlay,
