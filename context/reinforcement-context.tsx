@@ -8,6 +8,7 @@ import {
   useState,
   type ReactNode
 } from "react";
+import concaveman from "concaveman";
 
 import { mockMeshZones, mockSlabGeometry } from "@/data/mockStructureData";
 import { pointInPolygon } from "@/lib/geometry/clipping";
@@ -50,13 +51,13 @@ const contourEdgeTolerance = 2_200;
 const contourEdgeBandLength = 5_000;
 const contourEdgeBandDepth = 1_800;
 
-type DesignAreaDrawingMode = "polygon" | "rectangle";
+type DesignAreaDrawingMode = "polygon" | "rectangle" | "axis-rectangle";
 type DesignAreaDrawingPurpose = Extract<
   SlabDesignAreaPurpose,
   "no-mesh" | "extra-mesh"
 >;
 type StrapLayerAxis = "x" | "y";
-type AnalysisViewMode = "x" | "y" | "both";
+type AnalysisViewMode = "x" | "y" | "both" | "governing";
 type RawDeficitPoint = Point & {
   requiredAs: number;
 };
@@ -128,7 +129,11 @@ type ReinforcementContextValue = {
   finishDesignAreaDraft: () => boolean;
   commitDesignAreaPolygon: (
     polygon: Point[],
-    purpose?: SlabDesignAreaPurpose
+    purpose?: SlabDesignAreaPurpose,
+    options?: {
+      axisLine?: ExtraMeshDesignZone["axisLine"];
+      axisLines?: ExtraMeshDesignZone["axisLines"];
+    }
   ) => boolean;
   importSlabGeometry: (slabGeometry: SlabGeometry) => void;
   addDxfUnderlay: (underlay: DwgUnderlay) => void;
@@ -345,6 +350,39 @@ function polygonsOverlap(first: Polygon, second: Polygon) {
   return polygonOverlapArea(first, second) > 1;
 }
 
+function clusterIslandPolygon(
+  evidence: AnalysisEvidenceCell[],
+  fallbackBounds: ReturnType<typeof boundsFromPolygon>
+): Polygon {
+  const points = evidence.flatMap((cell) => [
+    ...cell.polygon,
+    evidenceCenter(cell)
+  ]);
+  const uniquePoints = Array.from(
+    new Map(
+      points.map((point) => [
+        `${Math.round(point.x)}:${Math.round(point.y)}`,
+        point
+      ])
+    ).values()
+  );
+
+  if (uniquePoints.length < 3) {
+    return rectanglePolygon(fallbackBounds);
+  }
+
+  const hull = concaveman(
+    uniquePoints.map((point) => [point.x, point.y]),
+    2,
+    extraZoneMergeGap / 2
+  );
+  const polygon = hull.map(([x, y]) => ({ x, y }));
+
+  return polygon.length >= 3 && polygonAreaAbs(polygon) > 1
+    ? polygon
+    : rectanglePolygon(fallbackBounds);
+}
+
 function maxContourRequiredAsInsidePolygon(
   underlay: DwgUnderlay | undefined,
   polygon: Polygon
@@ -534,7 +572,7 @@ function createAnalysisIslands(evidenceCells: AnalysisEvidenceCell[]) {
       maxExcessAsY,
       maxRequiredAsX,
       maxRequiredAsY,
-      polygon: rectanglePolygon(cluster.bounds)
+      polygon: clusterIslandPolygon(cluster.evidence, cluster.bounds)
     });
 
     for (const evidenceId of evidenceCellIds) {
@@ -559,7 +597,11 @@ function calculateExtraMeshDesignZone(
   slabGeometry: SlabGeometry,
   baseParameters: BaseMeshSettings,
   index: number,
-  existing?: ExtraMeshDesignZone
+  existing?: ExtraMeshDesignZone,
+  options?: {
+    axisLine?: ExtraMeshDesignZone["axisLine"];
+    axisLines?: ExtraMeshDesignZone["axisLines"];
+  }
 ): ExtraMeshDesignZone {
   const baseProvidedAs = providedAsForSettings(baseParameters);
   const coveredEvidence = (slabGeometry.analysisEvidenceCells ?? []).filter((evidence) =>
@@ -627,6 +669,8 @@ function calculateExtraMeshDesignZone(
     polygon,
     source: "manual",
     status: existing?.status === "accepted" ? "edited" : (existing?.status ?? "proposed"),
+    axisLine: options?.axisLine ?? existing?.axisLine,
+    axisLines: options?.axisLines ?? existing?.axisLines,
     coveredIslandIds,
     coveredEvidenceCellIds: coveredEvidence.map((evidence) => evidence.id),
     direction,
@@ -1742,7 +1786,14 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
   }, [activeMeshZone.parameters, boundaryDraftPoints, slabGeometry]);
 
   const commitDesignAreaPolygon = useCallback(
-    (polygon: Point[], purpose: SlabDesignAreaPurpose = designAreaDrawingPurpose) => {
+    (
+      polygon: Point[],
+      purpose: SlabDesignAreaPurpose = designAreaDrawingPurpose,
+      options?: {
+        axisLine?: ExtraMeshDesignZone["axisLine"];
+        axisLines?: ExtraMeshDesignZone["axisLines"];
+      }
+    ) => {
       if (!slabGeometry.hasActiveSlabBoundary || polygon.length < 3) {
         return false;
       }
@@ -1756,7 +1807,9 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
             polygon,
             slabGeometry,
             activeMeshZone.parameters,
-            slabGeometry.extraMeshDesignZones?.length ?? 0
+            slabGeometry.extraMeshDesignZones?.length ?? 0,
+            undefined,
+            options
           )
         : null;
       const standardizedExtraMesh = standardizeExtraMeshSchedules(
@@ -2411,6 +2464,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
         : { strapLayerY: nextUnderlay })
     }));
     setActiveDxfUnderlayId(nextUnderlay.id ?? null);
+    setShowRawStrapLayers(false);
   }, []);
 
   const deleteStrapLayer = useCallback((axis: StrapLayerAxis) => {
@@ -2570,8 +2624,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       strapOverloadedElements,
       strapAnalysisDebug
     }));
-    setAnalysisViewMode("both");
-    setShowRawStrapLayers(true);
+    setAnalysisViewMode("governing");
+    setShowRawStrapLayers(false);
 
     return strapOverloadedElements.length;
   }, [

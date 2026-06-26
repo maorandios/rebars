@@ -729,8 +729,8 @@ export function MeshZonesPanel({
                 <div className="mb-2 text-xs font-medium text-muted-foreground">
                   Analysis display
                 </div>
-                <div className="grid grid-cols-3 gap-1">
-                  {(["x", "y", "both"] as const).map((mode) => (
+                <div className="grid grid-cols-4 gap-1">
+                  {(["governing", "x", "y", "both"] as const).map((mode) => (
                     <Button
                       key={mode}
                       className="h-8 px-2 text-xs"
@@ -738,7 +738,13 @@ export function MeshZonesPanel({
                       variant={analysisViewMode === mode ? "secondary" : "outline"}
                       onClick={() => setAnalysisViewMode(mode)}
                     >
-                      {mode === "x" ? "X" : mode === "y" ? "Y" : "Both"}
+                      {mode === "governing"
+                        ? "Gov"
+                        : mode === "x"
+                          ? "X"
+                          : mode === "y"
+                            ? "Y"
+                            : "X+Y"}
                     </Button>
                   ))}
                 </div>
@@ -859,7 +865,21 @@ export function MeshZonesPanel({
                   <div className="text-muted-foreground">zones</div>
                 </div>
               </div>
-              <div className="mt-3 grid grid-cols-2 gap-2">
+              <div className="mt-3 grid grid-cols-3 gap-2">
+                <Button
+                  disabled={!hasActiveSlabBoundary}
+                  type="button"
+                  variant={
+                    isDrawingDesignArea &&
+                    designAreaDrawingPurpose === "extra-mesh" &&
+                    designAreaDrawingMode === "axis-rectangle"
+                      ? "secondary"
+                      : "outline"
+                  }
+                  onClick={() => beginDesignAreaDraw("axis-rectangle", "extra-mesh")}
+                >
+                  Axis Zone
+                </Button>
                 <Button
                   disabled={!hasActiveSlabBoundary}
                   type="button"
@@ -891,9 +911,14 @@ export function MeshZonesPanel({
               </div>
               {isDrawingDesignArea && designAreaDrawingPurpose === "extra-mesh" ? (
                 <div className="mt-3 rounded-xl border border-violet-300/30 bg-background/40 p-2 text-xs leading-5 text-violet-100">
-                  {designAreaDrawingMode === "polygon"
-                    ? `Trace points: ${designAreaDraftPoints.length}`
-                    : "Drag the zone rectangle on the canvas."}
+                  {designAreaDrawingMode === "axis-rectangle"
+                    ? `Pick axis points ${Math.min(
+                        designAreaDraftPoints.length + 1,
+                        4
+                      )}/4: line 1-2 length, then line 3-4 width.`
+                    : designAreaDrawingMode === "polygon"
+                      ? `Trace points: ${designAreaDraftPoints.length}`
+                      : "Drag the zone rectangle on the canvas."}
                   <div className="mt-2 flex gap-2">
                     {designAreaDrawingMode === "polygon" ? (
                       <Button

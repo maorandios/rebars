@@ -180,6 +180,20 @@ export type ExtraMeshDesignZone = {
   status: "proposed" | "accepted" | "edited";
   coveredIslandIds: string[];
   coveredEvidenceCellIds: string[];
+  axisLine?: {
+    start: Point;
+    end: Point;
+  };
+  axisLines?: {
+    primary?: {
+      start: Point;
+      end: Point;
+    };
+    secondary?: {
+      start: Point;
+      end: Point;
+    };
+  };
   direction: "x" | "y" | "both";
   demand: {
     maxRequiredAsX: number;

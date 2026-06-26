@@ -62,8 +62,35 @@ type ZoneDraft = {
   start: Point;
 };
 
+type AxisRectangleDraft = {
+  current: Point | null;
+};
+
 function distance(a: Point, b: Point) {
   return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function projectPointToSegment(point: Point, start: Point, end: Point) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSquared = dx * dx + dy * dy;
+
+  if (lengthSquared === 0) {
+    return start;
+  }
+
+  const t = Math.max(
+    0,
+    Math.min(
+      1,
+      ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared
+    )
+  );
+
+  return {
+    x: start.x + t * dx,
+    y: start.y + t * dy
+  };
 }
 
 function dxfUnderlayScale(underlay: DwgUnderlay) {
@@ -461,270 +488,64 @@ function drawRawDeficitZones(
   }
 }
 
-function demandOpacity(requiredAs: number, maxRequiredAs: number) {
-  const ratio = maxRequiredAs > 0 ? requiredAs / maxRequiredAs : 0;
-
-  return Math.max(0.08, Math.min(0.9, ratio ** 1.6 * 0.9));
-}
-
-function parseContourLabelValue(text: string) {
-  const normalized = text.replace(",", ".").trim();
-  const match = normalized.match(/[-+]?\d*\.?\d+/);
-
-  if (!match) {
-    return null;
+function heatmapColor(ratio: number) {
+  if (ratio >= 0.9) {
+    return "#dc2626";
+  }
+  if (ratio >= 0.65) {
+    return "#ef4444";
+  }
+  if (ratio >= 0.35) {
+    return "#f87171";
   }
 
-  const value = Number(match[0]);
-
-  return Number.isFinite(value) ? value : null;
+  return "#fecaca";
 }
 
-function lineCenter(points: Point[]) {
-  return points.reduce(
-    (sum, point, _, allPoints) => ({
-      x: sum.x + point.x / allPoints.length,
-      y: sum.y + point.y / allPoints.length
-    }),
-    { x: 0, y: 0 }
-  );
-}
+function hexToRgb(hex: string) {
+  const normalized = hex.replace("#", "");
+  const value = Number.parseInt(normalized, 16);
 
-function pointToSegmentDistance(point: Point, start: Point, end: Point) {
-  const dx = end.x - start.x;
-  const dy = end.y - start.y;
-  const lengthSquared = dx * dx + dy * dy;
-
-  if (lengthSquared === 0) {
-    return Math.hypot(point.x - start.x, point.y - start.y);
-  }
-
-  const t = Math.max(
-    0,
-    Math.min(
-      1,
-      ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared
-    )
-  );
-  const projection = {
-    x: start.x + t * dx,
-    y: start.y + t * dy
+  return {
+    b: value & 255,
+    g: (value >> 8) & 255,
+    r: (value >> 16) & 255
   };
-
-  return Math.hypot(point.x - projection.x, point.y - projection.y);
 }
 
-function pointToPolylineDistance(point: Point, points: Point[]) {
-  if (points.length === 0) {
-    return Number.POSITIVE_INFINITY;
-  }
+function rgba(hex: string, alpha: number) {
+  const { r, g, b } = hexToRgb(hex);
 
-  if (points.length === 1) {
-    return Math.hypot(point.x - points[0].x, point.y - points[0].y);
-  }
-
-  return points.slice(0, -1).reduce((nearest, start, index) => {
-    const end = points[index + 1];
-
-    return Math.min(nearest, pointToSegmentDistance(point, start, end));
-  }, Number.POSITIVE_INFINITY);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
-function isContourLayer(layer: string) {
-  const normalized = layer.toUpperCase();
-
-  return (
-    normalized.includes("CONTOUR") ||
-    normalized.includes("CONTO") ||
-    normalized.includes("ASX") ||
-    normalized.includes("ASY")
-  );
-}
-
-function isLikelyContourLine(line: CadLineEntity) {
-  if (isContourLayer(line.layer)) {
-    return true;
-  }
-
-  if (line.points.length < 3) {
-    return false;
-  }
-
-  const first = line.points[0];
-  const last = line.points.at(-1) ?? first;
-  const isClosed = Math.hypot(first.x - last.x, first.y - last.y) < 1;
-  const hasDirectionChange = line.points.slice(1, -1).some((point, index) => {
-    const previous = line.points[index];
-    const next = line.points[index + 2];
-    const firstAngle = Math.atan2(point.y - previous.y, point.x - previous.x);
-    const nextAngle = Math.atan2(next.y - point.y, next.x - point.x);
-
-    return Math.abs(firstAngle - nextAngle) > 0.08;
-  });
-
-  return (isClosed && line.points.length > 5) || hasDirectionChange;
-}
-
-type DisplayContourLine = {
-  id: string;
-  points: Point[];
-  value?: number;
-};
-
-function assignContourValues(
-  contourLines: DisplayContourLine[],
-  contourLabels: { point: Point; value: number }[]
+function evidenceHeatmapValue(
+  evidence: AnalysisEvidenceCell,
+  axis: "x" | "y"
 ) {
-  const valuesByLine = new Map<string, number[]>();
-
-  for (const label of contourLabels) {
-    const nearest = contourLines.reduce<{
-      distance: number;
-      line: DisplayContourLine;
-    } | null>((currentNearest, line) => {
-      const distance = pointToPolylineDistance(label.point, line.points);
-
-      if (!currentNearest || distance < currentNearest.distance) {
-        return { distance, line };
-      }
-
-      return currentNearest;
-    }, null);
-
-    if (!nearest) {
-      continue;
-    }
-
-    valuesByLine.set(nearest.line.id, [
-      ...(valuesByLine.get(nearest.line.id) ?? []),
-      label.value
-    ]);
-  }
-
-  const labeledLines = contourLines
-    .map((line) => {
-      const values = valuesByLine.get(line.id);
-
-      return values
-        ? {
-            ...line,
-            value: values.reduce((sum, value) => sum + value / values.length, 0)
-          }
-        : line;
-    })
-    .filter((line): line is DisplayContourLine & { value: number } =>
-      Boolean(line.value)
-    );
-
-  return contourLines.map((line) => {
-    const directValues = valuesByLine.get(line.id);
-
-    if (directValues) {
-      return {
-        ...line,
-        value: directValues.reduce((sum, value) => sum + value / directValues.length, 0)
-      };
-    }
-
-    const center = lineCenter(line.points);
-    const nearestLabeledLine = labeledLines.reduce<{
-      distance: number;
-      value: number;
-    } | null>((nearest, labeledLine) => {
-      const distance = pointToPolylineDistance(center, labeledLine.points);
-
-      if (!nearest || distance < nearest.distance) {
-        return { distance, value: labeledLine.value };
-      }
-
-      return nearest;
-    }, null);
-
-    return {
-      ...line,
-      value: nearestLabeledLine?.value
-    };
-  });
+  return evidence.axis === axis ? evidence.requiredAs : 0;
 }
 
-function drawAnalysisAxisContourLines(
-  context: CanvasRenderingContext2D,
-  slabGeometry: SlabGeometry,
-  axis: AnalysisEvidenceCell["axis"],
-  scale: number
+function evidenceHeatmapRadius(evidence: AnalysisEvidenceCell) {
+  const bounds = polygonBounds(evidence.polygon);
+  const width = bounds.maxX - bounds.minX;
+  const height = bounds.maxY - bounds.minY;
+
+  return Math.max(900, Math.min(2_600, Math.max(width, height) * 2.1));
+}
+
+function islandHeatmapValue(
+  island: AnalysisIsland,
+  mode: "x" | "y" | "both" | "governing"
 ) {
-  const underlay = axis === "x" ? slabGeometry.strapLayerX : slabGeometry.strapLayerY;
-
-  if (!underlay) {
-    return;
+  if (mode === "x") {
+    return island.maxRequiredAsX;
+  }
+  if (mode === "y") {
+    return island.maxRequiredAsY;
   }
 
-  const visibleLayers = visibleUnderlayLayers(underlay);
-  const contourLabels = underlay.texts
-    .filter(
-      (text) =>
-        (visibleLayers.size === 0 || isLayerVisible(visibleLayers, text.layer))
-    )
-    .map((text) => ({
-      point: transformDxfPoint(underlay, text.position),
-      value: parseContourLabelValue(text.text)
-    }))
-    .filter(
-      (label): label is { point: Point; value: number } =>
-        label.value !== null && label.value > 0 && label.value <= 100
-    );
-  const maxContourValue = Math.max(0, ...contourLabels.map((label) => label.value));
-
-  if (maxContourValue <= 0) {
-    return;
-  }
-
-  const contourLines: DisplayContourLine[] = [
-    ...underlay.lines
-      .filter(
-        (line) =>
-          isLikelyContourLine(line) &&
-          line.points.length >= 2 &&
-          (visibleLayers.size === 0 || isLayerVisible(visibleLayers, line.layer))
-      )
-      .map((line) => ({
-        id: line.id,
-        points: line.points.map((point) => transformDxfPoint(underlay, point))
-      })),
-    ...(underlay.closedPolylines ?? [])
-      .filter(
-        (candidate) =>
-          (isContourLayer(candidate.layer) || candidate.polygon.length > 4) &&
-          (visibleLayers.size === 0 || isLayerVisible(visibleLayers, candidate.layer))
-      )
-      .map((candidate) => ({
-        id: candidate.id,
-        points: [...candidate.polygon, candidate.polygon[0]].map((point) =>
-          transformDxfPoint(underlay, point)
-        )
-      }))
-  ].filter((line) => line.points.length >= 2);
-  const valuedContourLines = assignContourValues(contourLines, contourLabels).toSorted(
-    (a, b) => (a.value ?? 0) - (b.value ?? 0)
-  );
-
-  context.save();
-  for (const line of valuedContourLines) {
-    const value = line.value;
-    const opacity = value ? demandOpacity(value, maxContourValue) : 0.1;
-    const ratio = value ? value / maxContourValue : 0.1;
-
-    drawPolylinePath(context, line.points);
-    setDraftStroke(context, scale, {
-      alpha: opacity,
-      color: "#f87171",
-      dash: axis === "y" ? [8, 5] : undefined,
-      widthPx: 0.9 + Math.min(1.4, ratio * 1.4)
-    });
-    context.stroke();
-    resetDraftStroke(context);
-  }
-  context.restore();
+  return Math.max(island.maxRequiredAsX, island.maxRequiredAsY);
 }
 
 function drawAnalysisIslandLabel(
@@ -749,21 +570,137 @@ function drawAnalysisIslandLabel(
   });
 }
 
+function drawAnalysisIslandBoundary(
+  context: CanvasRenderingContext2D,
+  island: AnalysisIsland,
+  value: number,
+  maxValue: number,
+  mode: "x" | "y" | "both" | "governing",
+  scale: number
+) {
+  if (island.polygon.length < 3 || value <= 0 || maxValue <= 0) {
+    return;
+  }
+
+  const ratio = Math.max(0, Math.min(1, value / maxValue));
+  const color = heatmapColor(ratio);
+
+  drawPolygonPath(context, island.polygon);
+  setDraftStroke(context, scale, {
+    alpha: 0.35 + ratio * 0.45,
+    color,
+    dash: mode === "y" ? [18, 8] : undefined,
+    widthPx: 1.2 + ratio * 1.8
+  });
+  context.stroke();
+  resetDraftStroke(context);
+}
+
+function drawSmoothEvidenceHeatmap(
+  context: CanvasRenderingContext2D,
+  slabGeometry: SlabGeometry,
+  analysisViewMode: "x" | "y" | "both" | "governing"
+) {
+  const axes =
+    analysisViewMode === "x"
+      ? (["x"] as const)
+      : analysisViewMode === "y"
+        ? (["y"] as const)
+        : (["x", "y"] as const);
+  const axisEvidence = axes.map((axis) => {
+    const evidenceCells = (slabGeometry.analysisEvidenceCells ?? []).filter(
+      (evidence) => evidenceHeatmapValue(evidence, axis) > 0
+    );
+    const maxValue = Math.max(
+      0,
+      ...evidenceCells.map((evidence) => evidenceHeatmapValue(evidence, axis))
+    );
+
+    return { axis, evidenceCells, maxValue };
+  });
+
+  if (!axisEvidence.some(({ maxValue }) => maxValue > 0)) {
+    return false;
+  }
+
+  context.save();
+  context.globalCompositeOperation = "screen";
+
+  for (const { axis, evidenceCells, maxValue } of axisEvidence) {
+    if (maxValue <= 0) {
+      continue;
+    }
+
+    for (const evidence of evidenceCells.toSorted(
+      (a, b) => evidenceHeatmapValue(a, axis) - evidenceHeatmapValue(b, axis)
+    )) {
+      const value = evidenceHeatmapValue(evidence, axis);
+      const ratio = Math.max(0, Math.min(1, value / maxValue));
+      const center = polygonCenter(evidence.polygon);
+      const radius = evidenceHeatmapRadius(evidence);
+      const color = heatmapColor(ratio);
+      const alpha = 0.04 + ratio ** 1.45 * 0.18;
+      const gradient = context.createRadialGradient(
+        center.x,
+        center.y,
+        0,
+        center.x,
+        center.y,
+        radius
+      );
+
+      gradient.addColorStop(0, rgba(color, alpha));
+      gradient.addColorStop(0.45, rgba(color, alpha * 0.42));
+      gradient.addColorStop(1, rgba(color, 0));
+      context.fillStyle = gradient;
+      context.beginPath();
+      context.arc(center.x, center.y, radius, 0, Math.PI * 2);
+      context.fill();
+    }
+  }
+
+  context.restore();
+  return true;
+}
+
 function drawAnalysisHeatMap(
   context: CanvasRenderingContext2D,
   slabGeometry: SlabGeometry,
   scale: number,
-  analysisViewMode: "x" | "y" | "both"
+  analysisViewMode: "x" | "y" | "both" | "governing"
 ) {
   const islands = slabGeometry.analysisIslands ?? [];
+  const visibleIslands = islands.filter(
+    (island) => islandHeatmapValue(island, analysisViewMode) > 0
+  );
+  const maxValue = Math.max(
+    0,
+    ...visibleIslands.map((island) => islandHeatmapValue(island, analysisViewMode))
+  );
 
   context.save();
   clipToSlabBoundary(context, slabGeometry);
-  if (analysisViewMode === "x" || analysisViewMode === "both") {
-    drawAnalysisAxisContourLines(context, slabGeometry, "x", scale);
-  }
-  if (analysisViewMode === "y" || analysisViewMode === "both") {
-    drawAnalysisAxisContourLines(context, slabGeometry, "y", scale);
+  const drewSmoothHeatmap = drawSmoothEvidenceHeatmap(
+    context,
+    slabGeometry,
+    analysisViewMode
+  );
+
+  if (!drewSmoothHeatmap) {
+    for (const island of visibleIslands.toSorted(
+      (a, b) =>
+        islandHeatmapValue(a, analysisViewMode) -
+        islandHeatmapValue(b, analysisViewMode)
+    )) {
+      drawAnalysisIslandBoundary(
+        context,
+        island,
+        islandHeatmapValue(island, analysisViewMode),
+        maxValue,
+        analysisViewMode,
+        scale
+      );
+    }
   }
   context.restore();
 
@@ -791,6 +728,54 @@ function scheduleText(schedule: ExtraMeshDesignZone["recommendedSchedule"]) {
   }
 
   return parts.length > 0 ? parts.join("\n") : "No extra mesh required";
+}
+
+function axisScheduleText(
+  zone: ExtraMeshDesignZone,
+  slabGeometry: SlabGeometry,
+  axis: "x" | "y"
+) {
+  const schedule = zone.recommendedSchedule?.[axis];
+
+  if (!schedule) {
+    return null;
+  }
+
+  const scheduleType = zone.scheduleTypeIds?.[axis]
+    ? (slabGeometry.extraMeshScheduleTypes ?? []).find(
+        (type) => type.id === zone.scheduleTypeIds?.[axis]
+      )?.label
+    : undefined;
+
+  return `${scheduleType ?? axis.toUpperCase()} Ø${schedule.diameter}@${schedule.spacing}`;
+}
+
+function drawScheduleOnAxisLine(
+  context: CanvasRenderingContext2D,
+  line: { start: Point; end: Point } | undefined,
+  text: string | null,
+  scale: number
+) {
+  if (!line || !text) {
+    return;
+  }
+
+  const mid = lineMidpoint(line.start, line.end);
+  const angle = Math.atan2(line.end.y - line.start.y, line.end.x - line.start.x);
+
+  drawPolylinePath(context, [line.start, line.end]);
+  setDraftStroke(context, scale, {
+    alpha: 0.92,
+    color: "#ffffff",
+    widthPx: 1.2
+  });
+  context.stroke();
+  resetDraftStroke(context);
+  drawText(context, text, mid.x, mid.y - screenPx(14, scale), scale, {
+    color: "#fef3c7",
+    height: cadTextHeight.small,
+    rotation: angle
+  });
 }
 
 function zoneScheduleTypeText(
@@ -821,29 +806,46 @@ function drawExtraMeshDesignZone(
   context.save();
   drawPolygonPath(context, zone.polygon);
   context.fillStyle = "#7c3aed";
-  context.globalAlpha = 0.22;
+  context.globalAlpha = 0.08;
   context.fill();
   context.globalAlpha = 1;
   setDraftStroke(context, scale, {
-    color: "#c4b5fd",
-    dash: zone.status === "proposed" ? [18, 8] : undefined,
-    widthPx: 3.2
+    alpha: 0.72,
+    color: "#ddd6fe",
+    dash: zone.status === "proposed" ? [8, 6] : undefined,
+    widthPx: 1.4
   });
   context.stroke();
   resetDraftStroke(context);
-  drawText(
-    context,
-    `${zone.label}\n${zoneScheduleTypeText(zone, slabGeometry)} | Islands ${
-      zone.coveredIslandIds.length
-    }\n${scheduleText(zone.recommendedSchedule)}`,
-    center.x,
-    center.y,
-    scale,
-    {
-      color: "#ffffff",
-      height: cadTextHeight.small
-    }
-  );
+
+  if (zone.axisLines?.primary || zone.axisLine) {
+    drawScheduleOnAxisLine(
+      context,
+      zone.axisLines?.primary ?? zone.axisLine,
+      axisScheduleText(zone, slabGeometry, "x"),
+      scale
+    );
+    drawScheduleOnAxisLine(
+      context,
+      zone.axisLines?.secondary,
+      axisScheduleText(zone, slabGeometry, "y"),
+      scale
+    );
+  } else {
+    drawText(
+      context,
+      `${zone.label}\n${zoneScheduleTypeText(zone, slabGeometry)} | Islands ${
+        zone.coveredIslandIds.length
+      }\n${scheduleText(zone.recommendedSchedule)}`,
+      center.x,
+      center.y,
+      scale,
+      {
+        color: "#ffffff",
+        height: cadTextHeight.small
+      }
+    );
+  }
   context.restore();
 }
 
@@ -1414,6 +1416,104 @@ function rectangleFromPoints(start: Point, end: Point): Polygon {
   ];
 }
 
+function addPoints(a: Point, b: Point): Point {
+  return { x: a.x + b.x, y: a.y + b.y };
+}
+
+function scalePoint(point: Point, factor: number): Point {
+  return { x: point.x * factor, y: point.y * factor };
+}
+
+function dotPoints(a: Point, b: Point) {
+  return a.x * b.x + a.y * b.y;
+}
+
+function unitVector(start: Point, end: Point): Point | null {
+  const length = distance(start, end);
+
+  if (length < minimumDesignAreaSize) {
+    return null;
+  }
+
+  return {
+    x: (end.x - start.x) / length,
+    y: (end.y - start.y) / length
+  };
+}
+
+function axisRectangleFromLines(points: Point[]): Polygon | null {
+  if (points.length < 4) {
+    return null;
+  }
+
+  const axis = unitVector(points[0], points[1]);
+
+  if (!axis) {
+    return null;
+  }
+
+  const normal = { x: -axis.y, y: axis.x };
+  const axisProjections = [points[0], points[1]].map((point) =>
+    dotPoints(point, axis)
+  );
+  const normalProjections = [points[2], points[3]].map((point) =>
+    dotPoints(point, normal)
+  );
+  const minAxis = Math.min(...axisProjections);
+  const maxAxis = Math.max(...axisProjections);
+  const minNormal = Math.min(...normalProjections);
+  const maxNormal = Math.max(...normalProjections);
+
+  if (
+    maxAxis - minAxis < minimumDesignAreaSize ||
+    maxNormal - minNormal < minimumDesignAreaSize
+  ) {
+    return null;
+  }
+
+  return [
+    addPoints(scalePoint(axis, minAxis), scalePoint(normal, minNormal)),
+    addPoints(scalePoint(axis, maxAxis), scalePoint(normal, minNormal)),
+    addPoints(scalePoint(axis, maxAxis), scalePoint(normal, maxNormal)),
+    addPoints(scalePoint(axis, minAxis), scalePoint(normal, maxNormal))
+  ];
+}
+
+function formatCmLength(lengthMm: number) {
+  return `${Math.round(lengthMm / 10)} cm`;
+}
+
+function lineMidpoint(start: Point, end: Point): Point {
+  return {
+    x: (start.x + end.x) / 2,
+    y: (start.y + end.y) / 2
+  };
+}
+
+function constrainOrthogonalEndpoint(start: Point, end: Point): Point {
+  return Math.abs(end.x - start.x) >= Math.abs(end.y - start.y)
+    ? { x: end.x, y: start.y }
+    : { x: start.x, y: end.y };
+}
+
+function constrainAxisRectanglePoint(points: Point[], point: Point): Point {
+  if (points.length === 1) {
+    return constrainOrthogonalEndpoint(points[0], point);
+  }
+
+  if (points.length === 3) {
+    const firstAxisIsHorizontal =
+      Math.abs(points[1].x - points[0].x) >=
+      Math.abs(points[1].y - points[0].y);
+
+    return firstAxisIsHorizontal
+      ? { x: points[2].x, y: point.y }
+      : { x: point.x, y: points[2].y };
+  }
+
+  return point;
+}
+
 function drawZoneDraft(
   context: CanvasRenderingContext2D,
   draft: ZoneDraft | null,
@@ -1477,13 +1577,125 @@ function drawBoundaryTrace(
   }
 }
 
+function drawDraftPoint(
+  context: CanvasRenderingContext2D,
+  point: Point,
+  scale: number,
+  label?: string
+) {
+  context.beginPath();
+  context.arc(point.x, point.y, screenPx(5, scale), 0, Math.PI * 2);
+  context.fillStyle = "#fbbf24";
+  context.fill();
+
+  if (label) {
+    drawText(
+      context,
+      label,
+      point.x + screenPx(12, scale),
+      point.y - screenPx(12, scale),
+      scale,
+      { color: "#fef3c7", height: cadTextHeight.small }
+    );
+  }
+}
+
+function drawDimensionLine(
+  context: CanvasRenderingContext2D,
+  start: Point,
+  end: Point,
+  scale: number,
+  labelPrefix: string
+) {
+  drawPolylinePath(context, [start, end]);
+  setDraftStroke(context, scale, {
+    color: "#fbbf24",
+    dash: [12, 8],
+    widthPx: 2.2
+  });
+  context.stroke();
+  resetDraftStroke(context);
+
+  const mid = lineMidpoint(start, end);
+  const length = distance(start, end);
+
+  drawText(
+    context,
+    `${labelPrefix} ${formatCmLength(length)}`,
+    mid.x,
+    mid.y - screenPx(18, scale),
+    scale,
+    {
+      color: "#fef3c7",
+      height: cadTextHeight.small
+    }
+  );
+}
+
+function drawAxisRectangleDraft(
+  context: CanvasRenderingContext2D,
+  points: Point[],
+  currentPoint: Point | null,
+  scale: number
+) {
+  const previewPoints =
+    currentPoint && points.length > 0 ? [...points, currentPoint] : points;
+  const previewRectangle =
+    previewPoints.length >= 4 ? axisRectangleFromLines(previewPoints) : null;
+
+  if (previewRectangle) {
+    drawPolygonPath(context, previewRectangle);
+    context.fillStyle = "rgba(124, 58, 237, 0.16)";
+    context.fill();
+    setDraftStroke(context, scale, {
+      color: "#c4b5fd",
+      dash: [14, 7],
+      widthPx: 2.4
+    });
+    context.stroke();
+    resetDraftStroke(context);
+  }
+
+  if (points.length >= 2) {
+    drawDimensionLine(context, points[0], points[1], scale, "1-2");
+  } else if (points.length === 1 && currentPoint) {
+    drawDimensionLine(context, points[0], currentPoint, scale, "1-2");
+  }
+
+  if (points.length >= 4) {
+    drawDimensionLine(context, points[2], points[3], scale, "3-4");
+  } else if (points.length === 3 && currentPoint) {
+    drawDimensionLine(context, points[2], currentPoint, scale, "3-4");
+  }
+
+  for (const [index, point] of points.entries()) {
+    drawDraftPoint(context, point, scale, String(index + 1));
+  }
+
+  if (currentPoint && points.length < 4) {
+    drawDraftPoint(context, currentPoint, scale, String(points.length + 1));
+  }
+}
+
 function drawDesignAreaDraft(
   context: CanvasRenderingContext2D,
   points: Point[],
   snapPoint: Point | null,
   rectangleDraft: ZoneDraft | null,
+  axisRectangleDraft: AxisRectangleDraft | null,
+  drawingMode: "polygon" | "rectangle" | "axis-rectangle" | null,
   scale: number
 ) {
+  if (drawingMode === "axis-rectangle") {
+    drawAxisRectangleDraft(
+      context,
+      points,
+      axisRectangleDraft?.current ?? snapPoint,
+      scale
+    );
+    return;
+  }
+
   if (rectangleDraft) {
     drawPolygonPath(context, rectangleFromPoints(rectangleDraft.start, rectangleDraft.current));
     context.fillStyle = "rgba(251, 191, 36, 0.12)";
@@ -1518,11 +1730,8 @@ function drawDesignAreaDraft(
     resetDraftStroke(context);
   }
 
-  for (const point of points) {
-    context.beginPath();
-    context.arc(point.x, point.y, screenPx(5, scale), 0, Math.PI * 2);
-    context.fillStyle = "#fbbf24";
-    context.fill();
+  for (const [index, point] of points.entries()) {
+    drawDraftPoint(context, point, scale, String(index + 1));
   }
 
   if (snapPoint) {
@@ -1592,6 +1801,7 @@ export function StructureCanvas() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const zoneDraftRef = useRef<ZoneDraft | null>(null);
   const designAreaRectangleDraftRef = useRef<ZoneDraft | null>(null);
+  const designAreaAxisRectangleDraftRef = useRef<AxisRectangleDraft | null>(null);
   const editingVertexIndexRef = useRef<number | null>(null);
   const hasFitViewRef = useRef(false);
   const panRef = useRef({ x: canvasPadding, y: canvasPadding });
@@ -1751,6 +1961,8 @@ export function StructureCanvas() {
           designAreaDraftPoints,
           snapPoint,
           designAreaRectangleDraftRef.current,
+          designAreaAxisRectangleDraftRef.current,
+          designAreaDrawingMode,
           scaleRef.current
         );
         drawZoneDraft(context, zoneDraftRef.current, scaleRef.current);
@@ -1810,6 +2022,8 @@ export function StructureCanvas() {
       designAreaDraftPoints,
       snapPoint,
       designAreaRectangleDraftRef.current,
+      designAreaAxisRectangleDraftRef.current,
+      designAreaDrawingMode,
       scaleRef.current
     );
     drawZoneDraft(context, zoneDraftRef.current, scaleRef.current);
@@ -1820,6 +2034,7 @@ export function StructureCanvas() {
     boundaryDraftPoints,
     editingDesignAreaId,
     isEditingBoundary,
+    designAreaDrawingMode,
     designAreaDraftPoints,
     meshZones,
     slabGeometry,
@@ -1895,6 +2110,15 @@ export function StructureCanvas() {
   }, [canvasSize, renderCanvas, viewScale]);
 
   useEffect(() => {
+    if (!isDrawingDesignArea || designAreaDrawingMode !== "axis-rectangle") {
+      designAreaAxisRectangleDraftRef.current = null;
+    }
+    if (!isDrawingDesignArea || designAreaDrawingMode !== "rectangle") {
+      designAreaRectangleDraftRef.current = null;
+    }
+  }, [designAreaDrawingMode, isDrawingDesignArea]);
+
+  useEffect(() => {
     const container = containerRef.current;
 
     if (!container) {
@@ -1912,7 +2136,7 @@ export function StructureCanvas() {
       };
     };
 
-    const snapToDxfVertex = (worldPoint: Point) => {
+    const snapToDxfReference = (worldPoint: Point) => {
       const snapRadius = screenPx(15, scaleRef.current);
       const references =
         slabGeometry.dxfUnderlays ??
@@ -1938,6 +2162,42 @@ export function StructureCanvas() {
           if (nextDistance < closestDistance) {
             closest = offsetVertex;
             closestDistance = nextDistance;
+          }
+        }
+        for (const line of reference.lines) {
+          const points = line.points.map((point) => transformDxfPoint(reference, point));
+
+          for (let index = 0; index < points.length - 1; index += 1) {
+            const projectedPoint = projectPointToSegment(
+              worldPoint,
+              points[index],
+              points[index + 1]
+            );
+            const nextDistance = distance(worldPoint, projectedPoint);
+
+            if (nextDistance < closestDistance) {
+              closest = projectedPoint;
+              closestDistance = nextDistance;
+            }
+          }
+        }
+        for (const candidate of reference.closedPolylines ?? []) {
+          const points = [...candidate.polygon, candidate.polygon[0]].map((point) =>
+            transformDxfPoint(reference, point)
+          );
+
+          for (let index = 0; index < points.length - 1; index += 1) {
+            const projectedPoint = projectPointToSegment(
+              worldPoint,
+              points[index],
+              points[index + 1]
+            );
+            const nextDistance = distance(worldPoint, projectedPoint);
+
+            if (nextDistance < closestDistance) {
+              closest = projectedPoint;
+              closestDistance = nextDistance;
+            }
           }
         }
       }
@@ -2082,6 +2342,48 @@ export function StructureCanvas() {
           return;
         }
 
+        if (designAreaDrawingMode === "axis-rectangle") {
+          const worldPoint = eventToWorldPoint(event);
+          const snappedPoint = snapToDxfReference(worldPoint) ?? worldPoint;
+          const constrainedPoint = constrainAxisRectanglePoint(
+            designAreaDraftPoints,
+            snappedPoint
+          );
+          const nextPoints = [...designAreaDraftPoints, constrainedPoint];
+
+          designAreaAxisRectangleDraftRef.current = { current: null };
+          designAreaRectangleDraftRef.current = null;
+
+          if (nextPoints.length >= 4) {
+            const polygon = axisRectangleFromLines(nextPoints);
+
+            if (polygon) {
+              commitDesignAreaPolygon(polygon, undefined, {
+                axisLine: {
+                  end: nextPoints[1],
+                  start: nextPoints[0]
+                },
+                axisLines: {
+                  primary: {
+                    end: nextPoints[1],
+                    start: nextPoints[0]
+                  },
+                  secondary: {
+                    end: nextPoints[3],
+                    start: nextPoints[2]
+                  }
+                }
+              });
+            }
+          } else {
+            addDesignAreaDraftPoint(constrainedPoint);
+            setSnapPoint(constrainedPoint);
+          }
+
+          renderCanvas();
+          return;
+        }
+
         if (designAreaDrawingMode === "rectangle") {
           try {
             container.setPointerCapture(event.pointerId);
@@ -2100,7 +2402,7 @@ export function StructureCanvas() {
           return;
         }
 
-        const snappedPoint = snapToDxfVertex(eventToWorldPoint(event));
+        const snappedPoint = snapToDxfReference(eventToWorldPoint(event));
 
         if (!snappedPoint) {
           return;
@@ -2171,7 +2473,7 @@ export function StructureCanvas() {
           return;
         }
 
-        const snappedPoint = snapToDxfVertex(eventToWorldPoint(event));
+        const snappedPoint = snapToDxfReference(eventToWorldPoint(event));
 
         if (!snappedPoint) {
           return;
@@ -2245,7 +2547,7 @@ export function StructureCanvas() {
 
       if (editingVertexIndexRef.current !== null) {
         const worldPoint = eventToWorldPoint(event);
-        const nextPoint = snapToDxfVertex(worldPoint) ?? worldPoint;
+        const nextPoint = snapToDxfReference(worldPoint) ?? worldPoint;
 
         if (editingDesignAreaId) {
           updateDesignAreaPoint(
@@ -2278,8 +2580,24 @@ export function StructureCanvas() {
         return;
       }
 
+      if (isDrawingDesignArea && designAreaDrawingMode === "axis-rectangle") {
+        const worldPoint = eventToWorldPoint(event);
+        const snappedPoint = snapToDxfReference(worldPoint) ?? worldPoint;
+        const constrainedPoint = constrainAxisRectanglePoint(
+          designAreaDraftPoints,
+          snappedPoint
+        );
+
+        designAreaAxisRectangleDraftRef.current = {
+          current: constrainedPoint
+        };
+        setSnapPoint(constrainedPoint);
+        renderCanvas();
+        return;
+      }
+
       if (isDrawingBoundary || isDrawingDesignArea) {
-        setSnapPoint(snapToDxfVertex(eventToWorldPoint(event)));
+        setSnapPoint(snapToDxfReference(eventToWorldPoint(event)));
         renderCanvas();
       }
     };
@@ -2524,9 +2842,11 @@ export function StructureCanvas() {
       {isDrawingDesignArea ? (
         <div className="pointer-events-none absolute left-1/2 top-20 z-10 max-w-md -translate-x-1/2 rounded-md border border-amber-400/30 bg-background/90 px-4 py-2 text-sm font-medium text-amber-300 shadow-sm backdrop-blur">
           {designAreaDrawingPurpose === "extra-mesh"
-            ? designAreaDrawingMode === "rectangle"
-              ? "Drag the extra mesh design zone around hot regions."
-              : "Trace the extra mesh design zone around hot regions, then finish."
+            ? designAreaDrawingMode === "axis-rectangle"
+              ? "Pick 1-2 for length, then 3-4 for width. Dimensions update live in cm."
+              : designAreaDrawingMode === "rectangle"
+                ? "Drag the extra mesh design zone around hot regions."
+                : "Trace the extra mesh design zone around hot regions, then finish."
             : designAreaDrawingMode === "rectangle"
               ? "Drag a rectangular no-mesh area."
               : "Click DXF vertices to trace a no-mesh area, then finish."}
