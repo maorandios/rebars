@@ -55,6 +55,12 @@ const meshActiveBlue = "#38bdf8";
 const canvasText = "#f4f4f5";
 const canvasMutedText = "#d4d4d8";
 const calculatedSlabLayer = "CALCULATED-SLAB";
+const heatmapCacheMaxSize = 1_000;
+const extraMeshScheduleExtensionMm = 500;
+const extraMeshAnnotationOffsetMm = 220;
+const extraMeshLabelHeight = cadTextHeight.small * 0.72;
+const extraMeshDimensionArrowSize = 130;
+const extraMeshRebarLineWidthPx = 2.3;
 
 type ZoneDraft = {
   current: Point;
@@ -64,6 +70,11 @@ type ZoneDraft = {
 
 type AxisRectangleDraft = {
   current: Point | null;
+};
+
+type AnalysisHeatmapCache = {
+  bounds: ReturnType<typeof polygonBounds>;
+  canvas: HTMLCanvasElement;
 };
 
 function distance(a: Point, b: Point) {
@@ -139,6 +150,23 @@ function transformedDxfBounds(underlay: DwgUnderlay) {
 
 function screenPx(value: number, scale: number) {
   return value / scale;
+}
+
+function readableTextAngle(angle: number) {
+  return angle > Math.PI / 2 || angle < -Math.PI / 2 ? angle + Math.PI : angle;
+}
+
+function lineNormal(start: Point, end: Point): Point {
+  const length = distance(start, end);
+
+  if (length <= 0) {
+    return { x: 0, y: -1 };
+  }
+
+  return {
+    x: -(end.y - start.y) / length,
+    y: (end.x - start.x) / length
+  };
 }
 
 function drawPolygonPath(context: CanvasRenderingContext2D, polygon: Polygon) {
@@ -236,6 +264,13 @@ function polygonCenter(polygon: Polygon): Point {
     }),
     { x: 0, y: 0 }
   );
+}
+
+function pointAlongLine(line: { start: Point; end: Point }, t: number): Point {
+  return {
+    x: line.start.x + (line.end.x - line.start.x) * t,
+    y: line.start.y + (line.end.y - line.start.y) * t
+  };
 }
 
 function drawText(
@@ -429,9 +464,21 @@ function drawDesignArea(
   context.stroke();
   resetDraftStroke(context);
 
-  drawText(context, area.label, center.x, center.y, scale, {
+  const bounds = polygonBounds(area.polygon);
+  const labelPoint =
+    area.purpose === "extra-mesh"
+      ? {
+          x: center.x,
+          y: bounds.maxY - Math.min(240, (bounds.maxY - bounds.minY) * 0.22)
+        }
+      : center;
+
+  drawText(context, area.label, labelPoint.x, labelPoint.y, scale, {
     color,
-    height: cadTextHeight.small
+    height:
+      area.purpose === "extra-mesh"
+        ? extraMeshLabelHeight
+        : cadTextHeight.small
   });
 }
 
@@ -443,6 +490,60 @@ function drawDesignAreas(
   for (const area of slabGeometry.designAreas ?? []) {
     drawDesignArea(context, area, scale);
   }
+}
+
+function drawSupportAxes(
+  context: CanvasRenderingContext2D,
+  slabGeometry: SlabGeometry,
+  draftPoints: Point[],
+  snapPoint: Point | null,
+  scale: number
+) {
+  for (const axis of slabGeometry.supportAxes ?? []) {
+    if (axis.visible === false) {
+      continue;
+    }
+
+    drawPolylinePath(context, [axis.start, axis.end]);
+    setDraftStroke(context, scale, {
+      alpha: 0.9,
+      color: "#a78bfa",
+      dash: [18, 10],
+      widthPx: 2
+    });
+    context.stroke();
+    resetDraftStroke(context);
+
+    const center = {
+      x: (axis.start.x + axis.end.x) / 2,
+      y: (axis.start.y + axis.end.y) / 2
+    };
+
+    drawText(context, axis.label, center.x, center.y, scale, {
+      color: "#ddd6fe",
+      height: cadTextHeight.small
+    });
+  }
+
+  if (draftPoints.length === 0) {
+    return;
+  }
+
+  const previewEnd = draftPoints[1] ?? snapPoint;
+
+  if (!previewEnd) {
+    return;
+  }
+
+  drawPolylinePath(context, [draftPoints[0], previewEnd]);
+  setDraftStroke(context, scale, {
+    alpha: 0.85,
+    color: "#c4b5fd",
+    dash: [12, 8],
+    widthPx: 2
+  });
+  context.stroke();
+  resetDraftStroke(context);
 }
 
 function drawRawDeficitZone(
@@ -502,23 +603,6 @@ function heatmapColor(ratio: number) {
   return "#fecaca";
 }
 
-function hexToRgb(hex: string) {
-  const normalized = hex.replace("#", "");
-  const value = Number.parseInt(normalized, 16);
-
-  return {
-    b: value & 255,
-    g: (value >> 8) & 255,
-    r: (value >> 16) & 255
-  };
-}
-
-function rgba(hex: string, alpha: number) {
-  const { r, g, b } = hexToRgb(hex);
-
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
-
 function evidenceHeatmapValue(
   evidence: AnalysisEvidenceCell,
   axis: "x" | "y"
@@ -531,7 +615,89 @@ function evidenceHeatmapRadius(evidence: AnalysisEvidenceCell) {
   const width = bounds.maxX - bounds.minX;
   const height = bounds.maxY - bounds.minY;
 
-  return Math.max(900, Math.min(2_600, Math.max(width, height) * 2.1));
+  return Math.max(550, Math.min(1_300, Math.max(width, height) * 1.15));
+}
+
+function analysisHeatmapAxes(mode: "x" | "y" | "both" | "governing") {
+  return mode === "x"
+    ? (["x"] as const)
+    : mode === "y"
+      ? (["y"] as const)
+      : (["x", "y"] as const);
+}
+
+function buildAnalysisHeatmapCache(
+  slabGeometry: SlabGeometry,
+  analysisViewMode: "x" | "y" | "both" | "governing"
+): AnalysisHeatmapCache | null {
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  const evidenceCells = slabGeometry.analysisEvidenceCells ?? [];
+  const axes = analysisHeatmapAxes(analysisViewMode);
+  const axisEvidence = axes.map((axis) => {
+    const axisCells = evidenceCells.filter(
+      (evidence) => evidenceHeatmapValue(evidence, axis) > 0
+    );
+    const maxValue = Math.max(
+      0,
+      ...axisCells.map((evidence) => evidenceHeatmapValue(evidence, axis))
+    );
+
+    return { axis, evidenceCells: axisCells, maxValue };
+  });
+
+  if (!axisEvidence.some(({ maxValue }) => maxValue > 0)) {
+    return null;
+  }
+
+  const bounds = polygonBounds(slabGeometry.boundary);
+  const width = Math.max(1, bounds.maxX - bounds.minX);
+  const height = Math.max(1, bounds.maxY - bounds.minY);
+  const pixelScale = Math.min(heatmapCacheMaxSize / width, heatmapCacheMaxSize / height);
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+
+  canvas.width = Math.max(1, Math.ceil(width * pixelScale));
+  canvas.height = Math.max(1, Math.ceil(height * pixelScale));
+
+  if (!context) {
+    return null;
+  }
+
+  for (const { axis, evidenceCells: axisCells, maxValue } of axisEvidence) {
+    if (maxValue <= 0) {
+      continue;
+    }
+
+    for (const evidence of axisCells.toSorted(
+      (a, b) => evidenceHeatmapValue(a, axis) - evidenceHeatmapValue(b, axis)
+    )) {
+      const value = evidenceHeatmapValue(evidence, axis);
+      const ratio = Math.max(0, Math.min(1, value / maxValue));
+      const center = polygonCenter(evidence.polygon);
+      const radius = Math.max(5, evidenceHeatmapRadius(evidence) * pixelScale);
+      const color = heatmapColor(ratio);
+      const alpha = 0.03 + ratio ** 1.4 * 0.12;
+
+      context.globalAlpha = alpha;
+      context.fillStyle = color;
+      context.beginPath();
+      context.arc(
+        (center.x - bounds.minX) * pixelScale,
+        (center.y - bounds.minY) * pixelScale,
+        radius,
+        0,
+        Math.PI * 2
+      );
+      context.fill();
+    }
+  }
+
+  context.globalAlpha = 1;
+
+  return { bounds, canvas };
 }
 
 function islandHeatmapValue(
@@ -596,69 +762,23 @@ function drawAnalysisIslandBoundary(
   resetDraftStroke(context);
 }
 
-function drawSmoothEvidenceHeatmap(
+function drawCachedEvidenceHeatmap(
   context: CanvasRenderingContext2D,
-  slabGeometry: SlabGeometry,
-  analysisViewMode: "x" | "y" | "both" | "governing"
+  cache: AnalysisHeatmapCache | null
 ) {
-  const axes =
-    analysisViewMode === "x"
-      ? (["x"] as const)
-      : analysisViewMode === "y"
-        ? (["y"] as const)
-        : (["x", "y"] as const);
-  const axisEvidence = axes.map((axis) => {
-    const evidenceCells = (slabGeometry.analysisEvidenceCells ?? []).filter(
-      (evidence) => evidenceHeatmapValue(evidence, axis) > 0
-    );
-    const maxValue = Math.max(
-      0,
-      ...evidenceCells.map((evidence) => evidenceHeatmapValue(evidence, axis))
-    );
-
-    return { axis, evidenceCells, maxValue };
-  });
-
-  if (!axisEvidence.some(({ maxValue }) => maxValue > 0)) {
+  if (!cache) {
     return false;
   }
 
   context.save();
-  context.globalCompositeOperation = "screen";
-
-  for (const { axis, evidenceCells, maxValue } of axisEvidence) {
-    if (maxValue <= 0) {
-      continue;
-    }
-
-    for (const evidence of evidenceCells.toSorted(
-      (a, b) => evidenceHeatmapValue(a, axis) - evidenceHeatmapValue(b, axis)
-    )) {
-      const value = evidenceHeatmapValue(evidence, axis);
-      const ratio = Math.max(0, Math.min(1, value / maxValue));
-      const center = polygonCenter(evidence.polygon);
-      const radius = evidenceHeatmapRadius(evidence);
-      const color = heatmapColor(ratio);
-      const alpha = 0.04 + ratio ** 1.45 * 0.18;
-      const gradient = context.createRadialGradient(
-        center.x,
-        center.y,
-        0,
-        center.x,
-        center.y,
-        radius
-      );
-
-      gradient.addColorStop(0, rgba(color, alpha));
-      gradient.addColorStop(0.45, rgba(color, alpha * 0.42));
-      gradient.addColorStop(1, rgba(color, 0));
-      context.fillStyle = gradient;
-      context.beginPath();
-      context.arc(center.x, center.y, radius, 0, Math.PI * 2);
-      context.fill();
-    }
-  }
-
+  context.imageSmoothingEnabled = true;
+  context.drawImage(
+    cache.canvas,
+    cache.bounds.minX,
+    cache.bounds.minY,
+    cache.bounds.maxX - cache.bounds.minX,
+    cache.bounds.maxY - cache.bounds.minY
+  );
   context.restore();
   return true;
 }
@@ -667,7 +787,8 @@ function drawAnalysisHeatMap(
   context: CanvasRenderingContext2D,
   slabGeometry: SlabGeometry,
   scale: number,
-  analysisViewMode: "x" | "y" | "both" | "governing"
+  analysisViewMode: "x" | "y" | "both" | "governing",
+  heatmapCache: AnalysisHeatmapCache | null
 ) {
   const islands = slabGeometry.analysisIslands ?? [];
   const visibleIslands = islands.filter(
@@ -680,11 +801,7 @@ function drawAnalysisHeatMap(
 
   context.save();
   clipToSlabBoundary(context, slabGeometry);
-  const drewSmoothHeatmap = drawSmoothEvidenceHeatmap(
-    context,
-    slabGeometry,
-    analysisViewMode
-  );
+  const drewSmoothHeatmap = drawCachedEvidenceHeatmap(context, heatmapCache);
 
   if (!drewSmoothHeatmap) {
     for (const island of visibleIslands.toSorted(
@@ -733,7 +850,8 @@ function scheduleText(schedule: ExtraMeshDesignZone["recommendedSchedule"]) {
 function axisScheduleText(
   zone: ExtraMeshDesignZone,
   slabGeometry: SlabGeometry,
-  axis: "x" | "y"
+  axis: "x" | "y",
+  line: { start: Point; end: Point }
 ) {
   const schedule = zone.recommendedSchedule?.[axis];
 
@@ -747,35 +865,139 @@ function axisScheduleText(
       )?.label
     : undefined;
 
-  return `${scheduleType ?? axis.toUpperCase()} Ø${schedule.diameter}@${schedule.spacing}`;
+  return `${scheduleType ?? axis.toUpperCase()} Ø${schedule.diameter}@${
+    schedule.spacing
+  } L=${formatCmLength(distance(line.start, line.end))}`;
 }
 
-function drawScheduleOnAxisLine(
+function drawLineText(
   context: CanvasRenderingContext2D,
   line: { start: Point; end: Point } | undefined,
   text: string | null,
-  scale: number
+  scale: number,
+  options: {
+    color: string;
+    dash?: number[];
+    labelT?: number;
+    offsetMm?: number;
+    textColor: string;
+    widthPx: number;
+  }
 ) {
   if (!line || !text) {
     return;
   }
 
-  const mid = lineMidpoint(line.start, line.end);
+  const labelAnchor = pointAlongLine(line, options.labelT ?? 0.5);
   const angle = Math.atan2(line.end.y - line.start.y, line.end.x - line.start.x);
+  const normal = lineNormal(line.start, line.end);
+  const labelOffset = options.offsetMm ?? extraMeshAnnotationOffsetMm;
+  const labelPoint = {
+    x: labelAnchor.x + normal.x * labelOffset,
+    y: labelAnchor.y + normal.y * labelOffset
+  };
 
+  context.save();
+  context.lineCap = "round";
+  context.lineJoin = "round";
   drawPolylinePath(context, [line.start, line.end]);
   setDraftStroke(context, scale, {
     alpha: 0.92,
-    color: "#ffffff",
-    widthPx: 1.2
+    color: options.color,
+    dash: options.dash,
+    widthPx: options.widthPx
   });
   context.stroke();
   resetDraftStroke(context);
-  drawText(context, text, mid.x, mid.y - screenPx(14, scale), scale, {
-    color: "#fef3c7",
-    height: cadTextHeight.small,
-    rotation: angle
+  context.restore();
+
+  drawText(context, text, labelPoint.x, labelPoint.y, scale, {
+    color: options.textColor,
+    height: extraMeshLabelHeight,
+    rotation: readableTextAngle(angle)
   });
+}
+
+function drawDimensionArrowHead(
+  context: CanvasRenderingContext2D,
+  point: Point,
+  inwardAngle: number
+) {
+  context.moveTo(point.x, point.y);
+  context.lineTo(
+    point.x + Math.cos(inwardAngle - Math.PI / 7) * extraMeshDimensionArrowSize,
+    point.y + Math.sin(inwardAngle - Math.PI / 7) * extraMeshDimensionArrowSize
+  );
+  context.moveTo(point.x, point.y);
+  context.lineTo(
+    point.x + Math.cos(inwardAngle + Math.PI / 7) * extraMeshDimensionArrowSize,
+    point.y + Math.sin(inwardAngle + Math.PI / 7) * extraMeshDimensionArrowSize
+  );
+}
+
+function drawDimensionLabel(
+  context: CanvasRenderingContext2D,
+  text: string,
+  point: Point,
+  angle: number
+) {
+  const readableAngle = readableTextAngle(angle);
+  const padding = extraMeshLabelHeight * 0.24;
+
+  context.save();
+  context.translate(point.x, point.y);
+  context.rotate(readableAngle);
+  context.font = `${extraMeshLabelHeight}px Consolas, "Courier New", monospace`;
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+
+  const width = context.measureText(text).width;
+
+  context.fillStyle = "rgba(18, 18, 20, 0.78)";
+  context.fillRect(
+    -width / 2 - padding,
+    -extraMeshLabelHeight / 2 - padding,
+    width + padding * 2,
+    extraMeshLabelHeight + padding * 2
+  );
+  context.fillStyle = "#ffffff";
+  context.fillText(text, 0, 0);
+  context.restore();
+}
+
+function drawDimensionAnnotation(
+  context: CanvasRenderingContext2D,
+  line: { start: Point; end: Point } | undefined,
+  text: string | null,
+  scale: number,
+  labelT = 0.5
+) {
+  if (!line || !text) {
+    return;
+  }
+
+  const angle = Math.atan2(line.end.y - line.start.y, line.end.x - line.start.x);
+  const labelPoint = pointAlongLine(line, labelT);
+
+  context.save();
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  drawPolylinePath(context, [line.start, line.end]);
+  setDraftStroke(context, scale, {
+    alpha: 0.95,
+    color: "#ffffff",
+    widthPx: 1.1
+  });
+  context.stroke();
+
+  context.beginPath();
+  drawDimensionArrowHead(context, line.start, angle);
+  drawDimensionArrowHead(context, line.end, angle + Math.PI);
+  context.stroke();
+  resetDraftStroke(context);
+  context.restore();
+
+  drawDimensionLabel(context, text, labelPoint, angle);
 }
 
 function zoneScheduleTypeText(
@@ -819,17 +1041,52 @@ function drawExtraMeshDesignZone(
   resetDraftStroke(context);
 
   if (zone.axisLines?.primary || zone.axisLine) {
-    drawScheduleOnAxisLine(
+    const dimensionX = zone.axisLines?.primary ?? zone.axisLine;
+    const dimensionY = zone.axisLines?.secondary;
+    const scheduleX = dimensionX
+      ? extendLine(
+          offsetLine(dimensionX, extraMeshAnnotationOffsetMm),
+          extraMeshScheduleExtensionMm
+        )
+      : undefined;
+    const scheduleY = dimensionY
+      ? extendLine(
+          offsetLine(dimensionY, extraMeshAnnotationOffsetMm),
+          extraMeshScheduleExtensionMm
+        )
+      : undefined;
+
+    drawDimensionAnnotation(context, dimensionX, `Dim X ${formatCmLength(
+      dimensionX ? distance(dimensionX.start, dimensionX.end) : 0
+    )}`, scale, 0.62);
+    drawDimensionAnnotation(context, dimensionY, dimensionY ? `Dim Y ${formatCmLength(
+      distance(dimensionY.start, dimensionY.end)
+    )}` : null, scale, 0.38);
+    drawLineText(
       context,
-      zone.axisLines?.primary ?? zone.axisLine,
-      axisScheduleText(zone, slabGeometry, "x"),
-      scale
+      scheduleX,
+      scheduleX ? axisScheduleText(zone, slabGeometry, "x", scheduleX) : null,
+      scale,
+      {
+        color: "#ffffff",
+        labelT: 0.34,
+        offsetMm: extraMeshAnnotationOffsetMm * 0.72,
+        textColor: "#ffffff",
+        widthPx: extraMeshRebarLineWidthPx
+      }
     );
-    drawScheduleOnAxisLine(
+    drawLineText(
       context,
-      zone.axisLines?.secondary,
-      axisScheduleText(zone, slabGeometry, "y"),
-      scale
+      scheduleY,
+      scheduleY ? axisScheduleText(zone, slabGeometry, "y", scheduleY) : null,
+      scale,
+      {
+        color: "#ffffff",
+        labelT: 0.66,
+        offsetMm: extraMeshAnnotationOffsetMm * 0.72,
+        textColor: "#ffffff",
+        widthPx: extraMeshRebarLineWidthPx
+      }
     );
   } else {
     drawText(
@@ -1490,6 +1747,54 @@ function lineMidpoint(start: Point, end: Point): Point {
   };
 }
 
+function extendLine(line: { start: Point; end: Point }, extension: number) {
+  const length = distance(line.start, line.end);
+
+  if (length <= 0) {
+    return line;
+  }
+
+  const unit = {
+    x: (line.end.x - line.start.x) / length,
+    y: (line.end.y - line.start.y) / length
+  };
+
+  return {
+    end: {
+      x: line.end.x + unit.x * extension,
+      y: line.end.y + unit.y * extension
+    },
+    start: {
+      x: line.start.x - unit.x * extension,
+      y: line.start.y - unit.y * extension
+    }
+  };
+}
+
+function offsetLine(line: { start: Point; end: Point }, offset: number) {
+  const length = distance(line.start, line.end);
+
+  if (length <= 0) {
+    return line;
+  }
+
+  const normal = {
+    x: -(line.end.y - line.start.y) / length,
+    y: (line.end.x - line.start.x) / length
+  };
+
+  return {
+    end: {
+      x: line.end.x + normal.x * offset,
+      y: line.end.y + normal.y * offset
+    },
+    start: {
+      x: line.start.x + normal.x * offset,
+      y: line.start.y + normal.y * offset
+    }
+  };
+}
+
 function constrainOrthogonalEndpoint(start: Point, end: Point): Point {
   return Math.abs(end.x - start.x) >= Math.abs(end.y - start.y)
     ? { x: end.x, y: start.y }
@@ -1618,16 +1923,24 @@ function drawDimensionLine(
 
   const mid = lineMidpoint(start, end);
   const length = distance(start, end);
+  const angle = Math.atan2(end.y - start.y, end.x - start.x);
+  const normal = lineNormal(start, end);
+  const labelOffset = extraMeshAnnotationOffsetMm * 0.72;
+  const labelPoint = {
+    x: mid.x + normal.x * labelOffset,
+    y: mid.y + normal.y * labelOffset
+  };
 
   drawText(
     context,
     `${labelPrefix} ${formatCmLength(length)}`,
-    mid.x,
-    mid.y - screenPx(18, scale),
+    labelPoint.x,
+    labelPoint.y,
     scale,
     {
       color: "#fef3c7",
-      height: cadTextHeight.small
+      height: extraMeshLabelHeight,
+      rotation: readableTextAngle(angle)
     }
   );
 }
@@ -1836,12 +2149,15 @@ export function StructureCanvas() {
     isDrawingDesignArea,
     designAreaDrawingMode,
     designAreaDrawingPurpose,
+    isDrawingSupportAxis,
     analysisViewMode,
     showRawStrapLayers,
     boundaryDraftPoints,
     designAreaDraftPoints,
+    supportAxisDraftPoints,
     addBoundaryTracePoint,
     addDesignAreaDraftPoint,
+    addSupportAxisDraftPoint,
     cancelDrawingZone,
     commitDesignAreaPolygon,
     commitDrawnMeshZone,
@@ -1861,6 +2177,10 @@ export function StructureCanvas() {
         activeMeshZone.geometry
       ),
     [activeMeshZone.geometry, activeMeshZone.parameters, slabGeometry]
+  );
+  const analysisHeatmapCache = useMemo(
+    () => buildAnalysisHeatmapCache(slabGeometry, analysisViewMode),
+    [analysisViewMode, slabGeometry]
   );
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
@@ -1929,12 +2249,20 @@ export function StructureCanvas() {
             drawSlabGeometry(context, slabGeometry, scaleRef.current);
           }
           drawDesignAreas(context, slabGeometry, scaleRef.current);
+          drawSupportAxes(
+            context,
+            slabGeometry,
+            supportAxisDraftPoints,
+            snapPoint,
+            scaleRef.current
+          );
           drawRawDeficitZones(context, slabGeometry, scaleRef.current);
           drawAnalysisHeatMap(
             context,
             slabGeometry,
             scaleRef.current,
-            analysisViewMode
+            analysisViewMode,
+            analysisHeatmapCache
           );
           drawStrapExtraMeshZones(context, slabGeometry, scaleRef.current);
           drawExtraMeshDesignZones(context, slabGeometry, scaleRef.current);
@@ -1987,12 +2315,20 @@ export function StructureCanvas() {
         );
       }
       drawDesignAreas(context, slabGeometry, scaleRef.current);
+      drawSupportAxes(
+        context,
+        slabGeometry,
+        supportAxisDraftPoints,
+        snapPoint,
+        scaleRef.current
+      );
       drawRawDeficitZones(context, slabGeometry, scaleRef.current);
       drawAnalysisHeatMap(
         context,
         slabGeometry,
         scaleRef.current,
-        analysisViewMode
+        analysisViewMode,
+        analysisHeatmapCache
       );
       drawStrapExtraMeshZones(context, slabGeometry, scaleRef.current);
       drawExtraMeshDesignZones(context, slabGeometry, scaleRef.current);
@@ -2030,12 +2366,14 @@ export function StructureCanvas() {
   }, [
     activeMeshZone.parameters,
     activeZoneId,
+    analysisHeatmapCache,
     analysisViewMode,
     boundaryDraftPoints,
     editingDesignAreaId,
     isEditingBoundary,
     designAreaDrawingMode,
     designAreaDraftPoints,
+    supportAxisDraftPoints,
     meshZones,
     slabGeometry,
     showRawStrapLayers,
@@ -2333,6 +2671,27 @@ export function StructureCanvas() {
           isDragging: true,
           start: worldPoint
         };
+        renderCanvas();
+        return;
+      }
+
+      if (isDrawingSupportAxis) {
+        if (event.button !== 0) {
+          return;
+        }
+
+        const worldPoint = eventToWorldPoint(event);
+        const snappedPoint = snapToDxfReference(worldPoint) ?? worldPoint;
+        const nextPoints = [...supportAxisDraftPoints, snappedPoint].slice(0, 2);
+
+        if (nextPoints.length >= 2) {
+          addSupportAxisDraftPoint(snappedPoint);
+          setSnapPoint(null);
+        } else {
+          addSupportAxisDraftPoint(snappedPoint);
+          setSnapPoint(snappedPoint);
+        }
+
         renderCanvas();
         return;
       }
@@ -2705,6 +3064,7 @@ export function StructureCanvas() {
   }, [
     addBoundaryTracePoint,
     addDesignAreaDraftPoint,
+    addSupportAxisDraftPoint,
     activeDxfUnderlayId,
     boundaryDraftPoints,
     cancelDrawingZone,
@@ -2715,11 +3075,13 @@ export function StructureCanvas() {
     finishDesignAreaDraft,
     isDrawingBoundary,
     isDrawingDesignArea,
+    isDrawingSupportAxis,
     isEditingBoundary,
     isDrawingZone,
     meshZones,
     designAreaDraftPoints,
     designAreaDrawingMode,
+    supportAxisDraftPoints,
     slabGeometry.boundary,
     slabGeometry.designAreas,
     slabGeometry.dxfUnderlays,
@@ -2800,6 +3162,7 @@ export function StructureCanvas() {
           isDrawingZone || isDrawingBoundary || isEditingBoundary
           || editingDesignAreaId
           || isDrawingDesignArea
+          || isDrawingSupportAxis
             ? "cursor-crosshair"
             : "cursor-default"
         }`}
@@ -2843,7 +3206,7 @@ export function StructureCanvas() {
         <div className="pointer-events-none absolute left-1/2 top-20 z-10 max-w-md -translate-x-1/2 rounded-md border border-amber-400/30 bg-background/90 px-4 py-2 text-sm font-medium text-amber-300 shadow-sm backdrop-blur">
           {designAreaDrawingPurpose === "extra-mesh"
             ? designAreaDrawingMode === "axis-rectangle"
-              ? "Pick 1-2 for length, then 3-4 for width. Dimensions update live in cm."
+              ? "Pick 1-2 and 3-4 for placement dimensions. X/Y steel schedule lines are generated after."
               : designAreaDrawingMode === "rectangle"
                 ? "Drag the extra mesh design zone around hot regions."
                 : "Trace the extra mesh design zone around hot regions, then finish."

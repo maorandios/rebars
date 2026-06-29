@@ -95,6 +95,21 @@ export type SlabDesignAreaPurpose =
   | "analysis-zone"
   | "custom";
 
+export type EngineeringPipelineStepId =
+  | "ingestion-cleanup"
+  | "constraints"
+  | "analytical-evaluation"
+  | "reinforcement-generation";
+
+export type EngineeringPipelineStep = {
+  id: EngineeringPipelineStepId;
+  label: string;
+  description: string;
+  isComplete: boolean;
+  isCurrent: boolean;
+  isLocked: boolean;
+};
+
 export type SlabDesignAreaSource = "user" | "dxf" | "fea";
 
 export type SlabDesignArea = {
@@ -241,6 +256,14 @@ export type StrapAnalysisDebug = {
   overloadedCsvRows?: number;
 };
 
+export type StructuralSupportAxis = {
+  id: string;
+  label: string;
+  start: Point;
+  end: Point;
+  visible: boolean;
+};
+
 export type StructuralElementType = "perimeter_wall" | "core_wall" | "column";
 
 export type StructuralElement = {
@@ -269,6 +292,8 @@ export type SlabGeometry = {
   strapAnalysisDebug?: StrapAnalysisDebug;
   rawDeficitZones?: RawDeficitZone[];
   designAreas?: SlabDesignArea[];
+  supportAxes?: StructuralSupportAxis[];
+  baseMeshSelection?: BaseMeshSelection;
   openings: SlabOpening[];
   structuralElements: StructuralElement[];
   concreteCover: number;
@@ -286,6 +311,22 @@ export type BaseMeshSettings = {
   gridOffsetY: number;
   orientation: "horizontal" | "vertical";
   wallAnchorageDepth: number;
+};
+
+export type BaseMeshType = "Q8" | "Q10" | "Q12";
+
+export type BaseMeshSelection = {
+  capacity: number;
+  diameter: BaseMeshSettings["diameter"];
+  dominantRequiredAs: number;
+  meshType: BaseMeshType;
+  selectedAt: string;
+  sourceElementCount: number;
+  spacing: BaseMeshSettings["spacing"];
+};
+
+export type BaseMeshRecommendation = Omit<BaseMeshSelection, "selectedAt"> & {
+  coveragePercent: number;
 };
 
 export type MeshZone = {

@@ -32,11 +32,15 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { useReinforcement } from "@/context/reinforcement-context";
 import { mockBaseMeshSettings } from "@/data/mockStructureData";
 import { parseDxfToSlabGeometry } from "@/lib/dxf-parser";
-import { compareBaseMeshOrientations } from "@/lib/geometry/mesh-sheet-layout";
+import {
+  compareBaseMeshOrientations,
+  findMostEfficientLayoutDirection
+} from "@/lib/geometry/mesh-sheet-layout";
 import { removeSlabGeometryProject } from "@/lib/project-storage";
 import type {
+  BaseMeshRecommendation,
   BaseMeshSettings,
-  BaseMeshSettingsUpdate,
+  BaseMeshType,
   ExtraMeshSchedule,
   StrapNumericalData
 } from "@/types/structure";
@@ -48,6 +52,35 @@ const originOptions: BaseMeshSettings["originCorner"][] = [
   "bottom-right",
   "top-left",
   "top-right"
+];
+const baseMeshOptions: {
+  capacity: number;
+  diameter: BaseMeshSettings["diameter"];
+  label: string;
+  meshType: BaseMeshType;
+  spacing: BaseMeshSettings["spacing"];
+}[] = [
+  {
+    capacity: 251,
+    diameter: 8,
+    label: "Q8 (פסיעה 200/200, קוטר 8 מ״מ)",
+    meshType: "Q8",
+    spacing: 200
+  },
+  {
+    capacity: 393,
+    diameter: 10,
+    label: "Q10 (פסיעה 200/200, קוטר 10 מ״מ)",
+    meshType: "Q10",
+    spacing: 200
+  },
+  {
+    capacity: 565,
+    diameter: 12,
+    label: "Q12 (פסיעה 200/200, קוטר 12 מ״מ)",
+    meshType: "Q12",
+    spacing: 200
+  }
 ];
 type NumericDraftValues = {
   sheetWidth: string;
@@ -70,7 +103,7 @@ export type InspectorContext =
   | { type: "area"; areaId: string }
   | { type: "mesh"; zoneId?: string };
 
-export type DockSection = "dxf" | "slab" | "mesh" | "analysis";
+export type DockSection = "dxf" | "constraints" | "analysis" | "reinforcement";
 
 type PanelProps = {
   activeDock: DockSection;
@@ -90,7 +123,11 @@ function createDraftValues(settings: BaseMeshSettings): NumericDraftValues {
 }
 
 function draftNumber(value: string, fallback: number) {
-  const nextValue = Number(value);
+  if (value.trim() === "") {
+    return fallback;
+  }
+
+  const nextValue = Number(value.replace(",", "."));
 
   return Number.isFinite(nextValue) ? nextValue : fallback;
 }
@@ -111,6 +148,24 @@ function formatSchedule(schedule: ExtraMeshSchedule) {
   return `Ø${schedule.diameter}@${schedule.spacing} (${roundedAs(
     schedule.providedAs
   )} mm²/m)${status}`;
+}
+
+function baseMeshOption(meshType: BaseMeshType) {
+  return baseMeshOptions.find((option) => option.meshType === meshType) ?? baseMeshOptions[1];
+}
+
+function selectionFromOption(
+  option: ReturnType<typeof baseMeshOption>,
+  recommendation: BaseMeshRecommendation
+) {
+  return {
+    capacity: option.capacity,
+    diameter: option.diameter,
+    dominantRequiredAs: recommendation.dominantRequiredAs,
+    meshType: option.meshType,
+    sourceElementCount: recommendation.sourceElementCount,
+    spacing: option.spacing
+  };
 }
 
 function scheduleTypeLabel(
@@ -239,6 +294,9 @@ export function MeshZonesPanel({
 }: PanelProps) {
   const {
     slabGeometry,
+    pipelineSteps,
+    canRunAnalyticalEvaluation,
+    canGenerateReinforcement,
     meshZones,
     selectedDesignAreaId,
     activeDxfUnderlayId,
@@ -256,12 +314,17 @@ export function MeshZonesPanel({
     clearStrapAnalysis,
     generateRawDeficitZones,
     beginDesignAreaDraw,
+    beginSupportAxisDraw,
+    cancelSupportAxisDraw,
+    deleteSupportAxis,
     cancelDesignAreaDraw,
     finishDesignAreaDraft,
     isDrawingDesignArea,
+    isDrawingSupportAxis,
     designAreaDrawingMode,
     designAreaDrawingPurpose,
     designAreaDraftPoints,
+    supportAxisDraftPoints,
     analysisViewMode,
     showRawStrapLayers,
     setAnalysisViewMode,
@@ -426,19 +489,19 @@ export function MeshZonesPanel({
   const title =
     activeDock === "dxf"
       ? "DXF Layers"
-      : activeDock === "slab"
-        ? "Slab View"
+      : activeDock === "constraints"
+        ? "Constraints Mode"
         : activeDock === "analysis"
-          ? "אנליזה"
-          : "Mesh Layers";
+          ? "Analytical Evaluation"
+          : "Reinforcement Generation";
   const description =
     activeDock === "dxf"
       ? "Reference drawing layers and visibility targets."
-      : activeDock === "slab"
-        ? "Working slab and opening/design-area layers."
+      : activeDock === "constraints"
+        ? "Define slab boundary, support axes, and void/opening zones."
         : activeDock === "analysis"
-          ? "Load and align STRAP X/Y analysis DXF underlays."
-          : "Base mesh layers that can stack on the slab.";
+          ? "Load STRAP/FEM data, run evaluation, and review heatmap overlays."
+          : "Final base mesh tiling and add-on reinforcement zones.";
 
   return (
     <>
@@ -455,6 +518,38 @@ export function MeshZonesPanel({
       </div>
 
       <div className="workflow-scrollbar flex-1 overflow-y-auto px-4 py-5">
+        <div className="mb-4 space-y-2 rounded-2xl border bg-background/60 p-3">
+          <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">
+            Engineering Pipeline
+          </div>
+          {pipelineSteps.map((step) => (
+            <div
+              key={step.id}
+              className={`rounded-xl border px-3 py-2 ${
+                step.isCurrent
+                  ? "border-primary/50 bg-primary/10"
+                  : step.isLocked
+                    ? "bg-muted/30 opacity-60"
+                    : "bg-background/50"
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                {step.isComplete ? (
+                  <CheckCircle2 className="h-4 w-4 text-emerald-300" />
+                ) : (
+                  <Circle className="h-4 w-4 text-muted-foreground" />
+                )}
+                <span className="text-xs font-semibold text-foreground">
+                  {step.label}
+                </span>
+              </div>
+              <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+                {step.description}
+              </p>
+            </div>
+          ))}
+        </div>
+
         {!hasImportedDxf && activeDock !== "analysis" ? (
           <div className="rounded-2xl border border-dashed p-4 text-sm leading-6 text-muted-foreground">
             No DXF project is loaded. Start from the homepage and upload a DXF
@@ -700,18 +795,16 @@ export function MeshZonesPanel({
             </div>
             <div className="rounded-2xl border border-fuchsia-300/25 bg-fuchsia-300/10 p-4">
               <div className="text-sm font-semibold text-foreground">
-                3-Way Data Cross-Reference
+                Run Analytical Evaluation
               </div>
               <p className="mt-2 text-xs leading-5 text-fuchsia-100/80">
-                Match STRAP CSV element maxima to physical DXF element polygons
-                and tint only overloaded elements.
+                Compute the mathematical maximum required As for each STRAP
+                element, then render the physical DXF tiles as a heatmap. No
+                commercial mesh is generated in this stage.
               </p>
               <Button
                 className="mt-3 w-full"
-                disabled={
-                  (!slabGeometry.strapLayerX && !slabGeometry.strapLayerY) ||
-                  !slabGeometry.strapNumericalData?.length
-                }
+                disabled={!canRunAnalyticalEvaluation}
                 type="button"
                 variant="secondary"
                 onClick={() => {
@@ -723,8 +816,14 @@ export function MeshZonesPanel({
                   );
                 }}
               >
-                בצע הצלבה הנדסית משולבת
+                Run Analytical Evaluation
               </Button>
+              {!canRunAnalyticalEvaluation ? (
+                <div className="mt-2 rounded-xl border border-dashed p-2 text-xs leading-5 text-muted-foreground">
+                  Requires STRAP X DXF, STRAP Y DXF, FEM Excel/CSV rows, active
+                  slab boundary, and at least one support axis.
+                </div>
+              ) : null}
               <div className="mt-3 rounded-xl border bg-background/40 p-2">
                 <div className="mb-2 text-xs font-medium text-muted-foreground">
                   Analysis display
@@ -915,7 +1014,7 @@ export function MeshZonesPanel({
                     ? `Pick axis points ${Math.min(
                         designAreaDraftPoints.length + 1,
                         4
-                      )}/4: line 1-2 length, then line 3-4 width.`
+                      )}/4: line 1-2 and 3-4 define placement dimensions. X/Y steel schedules are created with extension.`
                     : designAreaDrawingMode === "polygon"
                       ? `Trace points: ${designAreaDraftPoints.length}`
                       : "Drag the zone rectangle on the canvas."}
@@ -1221,8 +1320,88 @@ export function MeshZonesPanel({
           </div>
         ) : null}
 
-        {activeDock === "slab" && hasImportedDxf ? (
+        {activeDock === "constraints" && hasImportedDxf ? (
           <div className="space-y-3">
+            <div className="rounded-2xl border border-violet-300/25 bg-violet-300/10 p-4">
+              <div className="text-xs font-medium uppercase tracking-[0.16em] text-violet-100">
+                Constraints Mode Toolbar
+              </div>
+              <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                Define the engineering constraints before analysis: slab boundary,
+                support axes for lap splices, and void/opening no-mesh zones.
+              </p>
+              <div className="mt-3 grid grid-cols-1 gap-2">
+                <Button
+                  className="w-full"
+                  type="button"
+                  variant={inspectorContext.type === "slab" ? "secondary" : "outline"}
+                  onClick={() => setInspectorContext({ type: "slab" })}
+                >
+                  1. Slab Boundary
+                </Button>
+                <Button
+                  className="w-full"
+                  disabled={!hasActiveSlabBoundary}
+                  type="button"
+                  variant={isDrawingSupportAxis ? "secondary" : "outline"}
+                  onClick={beginSupportAxisDraw}
+                >
+                  2. Draw Support Axis
+                </Button>
+                <Button
+                  className="w-full"
+                  disabled={!hasActiveSlabBoundary}
+                  type="button"
+                  variant={
+                    isDrawingDesignArea &&
+                    designAreaDrawingPurpose === "no-mesh" &&
+                    designAreaDrawingMode === "rectangle"
+                      ? "secondary"
+                      : "outline"
+                  }
+                  onClick={() => beginDesignAreaDraw("rectangle", "no-mesh")}
+                >
+                  3. Void / Opening Box
+                </Button>
+              </div>
+              {isDrawingSupportAxis ? (
+                <div className="mt-3 rounded-xl border border-violet-300/30 bg-background/40 p-2 text-xs leading-5 text-violet-100">
+                  Pick support axis point {Math.min(supportAxisDraftPoints.length + 1, 2)}/2.
+                  <Button
+                    className="mt-2 h-8 w-full"
+                    type="button"
+                    variant="outline"
+                    onClick={cancelSupportAxisDraw}
+                  >
+                    Cancel Support Axis
+                  </Button>
+                </div>
+              ) : null}
+              <div className="mt-3 space-y-2">
+                {(slabGeometry.supportAxes ?? []).length === 0 ? (
+                  <div className="rounded-xl border border-dashed p-3 text-xs leading-5 text-muted-foreground">
+                    No support axes yet. At least one axis is required before the
+                    analytical evaluation can run.
+                  </div>
+                ) : null}
+                {(slabGeometry.supportAxes ?? []).map((axis, index) => (
+                  <div
+                    key={`${axis.id}-${index}`}
+                    className="flex items-center justify-between gap-2 rounded-xl border bg-background/50 px-3 py-2 text-xs"
+                  >
+                    <span className="font-medium text-foreground">{axis.label}</span>
+                    <Button
+                      className="h-7 px-2 text-[11px]"
+                      type="button"
+                      variant="outline"
+                      onClick={() => deleteSupportAxis(axis.id)}
+                    >
+                      Delete
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </div>
             <button
               className={`w-full rounded-2xl border p-4 text-left transition hover:border-primary/30 ${
                 inspectorContext.type === "slab"
@@ -1296,14 +1475,20 @@ export function MeshZonesPanel({
           </div>
         ) : null}
 
-        {activeDock === "mesh" && hasImportedDxf ? (
+        {activeDock === "reinforcement" && hasImportedDxf ? (
           <div className="space-y-3">
+            {!canGenerateReinforcement ? (
+              <div className="rounded-2xl border border-dashed p-4 text-sm leading-6 text-muted-foreground">
+                Reinforcement Generation is locked until the analytical heatmap
+                has been produced and validated. Run Step 4-5 first.
+              </div>
+            ) : null}
             {!hasGeneratedWorkingSlab ? (
               <div className="rounded-2xl border border-dashed p-4 text-sm leading-6 text-muted-foreground">
                 Define the working slab before creating mesh layers.
               </div>
             ) : null}
-            {hasGeneratedWorkingSlab
+            {hasGeneratedWorkingSlab && canGenerateReinforcement
               ? visibleMeshZones.map((zone) => (
                   <button
                     key={zone.id}
@@ -1333,13 +1518,13 @@ export function MeshZonesPanel({
                   </button>
                 ))
               : null}
-            {hasGeneratedWorkingSlab && !hasMainMeshApplied ? (
+            {hasGeneratedWorkingSlab && canGenerateReinforcement && !hasMainMeshApplied ? (
               <div className="rounded-xl border border-dashed p-3 text-xs leading-5 text-muted-foreground">
                 No main mesh yet. Use the right controller to add and configure
                 the main mesh first.
               </div>
             ) : null}
-            {hasGeneratedWorkingSlab && hasMainMeshApplied && nonMainMeshZones.length === 0 ? (
+            {hasGeneratedWorkingSlab && canGenerateReinforcement && hasMainMeshApplied && nonMainMeshZones.length === 0 ? (
               <div className="rounded-xl border border-dashed p-3 text-xs leading-5 text-muted-foreground">
                 Main mesh is active. Additional mesh layers can be added later.
               </div>
@@ -1469,6 +1654,7 @@ export function MeshInspectorPanel({
 }: PanelProps) {
   const {
     slabGeometry,
+    canGenerateReinforcement,
     activeZoneId,
     activeMeshZone,
     selectedDesignAreaId,
@@ -1480,6 +1666,7 @@ export function MeshInspectorPanel({
     designAreaDraftPoints,
     editingDesignAreaId,
     activateBaseMeshOnWorkingSlab,
+    clearBaseMeshFromWorkingSlab,
     beginBoundaryEdit,
     beginBoundaryTrace,
     beginDesignAreaDraw,
@@ -1494,7 +1681,9 @@ export function MeshInspectorPanel({
     finishDesignAreaDraft,
     finishDesignAreaEdit,
     generateSlabFromVisibleLayers,
+    getBaseMeshRecommendation,
     setCalculatedSlabVisible,
+    setBaseMeshSelection,
     setDesignAreaVisible,
     setSelectedDesignAreaId,
     setUnderlayLayerVisible,
@@ -1533,9 +1722,15 @@ export function MeshInspectorPanel({
     })
   );
   const [isMainMeshModalOpen, setIsMainMeshModalOpen] = useState(false);
-  const [mainMeshStep, setMainMeshStep] = useState(0);
+  const [baseMeshToast, setBaseMeshToast] = useState<string | null>(null);
+  const [selectedBaseMeshType, setSelectedBaseMeshType] =
+    useState<BaseMeshType>("Q10");
   const [mainMeshDraft, setMainMeshDraft] =
     useState<BaseMeshSettings>(activeSettings);
+  const baseMeshRecommendation = useMemo(
+    () => getBaseMeshRecommendation(),
+    [getBaseMeshRecommendation]
+  );
   const visibleDraft =
     numericDraft.zoneId === activeZoneId
       ? numericDraft.values
@@ -1585,16 +1780,7 @@ export function MeshInspectorPanel({
     visibleDraft.wallAnchorageDepth !==
       String(activeSettings.wallAnchorageDepth);
   const canShowMeshParameters =
-    hasMainMeshApplied || !activeMeshZone.isMainZone;
-  const mainMeshDraftComparison = useMemo(
-    () =>
-      compareBaseMeshOrientations(
-        slabGeometry,
-        mainMeshDraft,
-        activeMeshZone.geometry
-      ),
-    [activeMeshZone.geometry, mainMeshDraft, slabGeometry]
-  );
+    canGenerateReinforcement && (hasMainMeshApplied || !activeMeshZone.isMainZone);
 
   function updateDraftValue(field: keyof NumericDraftValues, value: string) {
     setNumericDraft((current) => ({
@@ -1645,22 +1831,91 @@ export function MeshInspectorPanel({
   }
 
   function openMainMeshModal() {
-    setMainMeshDraft(activeSettings);
-    setMainMeshStep(0);
+    const recommendation = getBaseMeshRecommendation();
+    const recommendedOption = recommendation
+      ? baseMeshOption(recommendation.meshType)
+      : baseMeshOption("Q10");
+
+    setSelectedBaseMeshType(recommendedOption.meshType);
+    setMainMeshDraft({
+      ...activeSettings,
+      diameter: recommendedOption.diameter,
+      spacing: recommendedOption.spacing
+    });
     setIsMainMeshModalOpen(true);
   }
 
-  function updateMainMeshDraft(patch: BaseMeshSettingsUpdate) {
-    setMainMeshDraft((current) => ({ ...current, ...patch }));
+  function updateSelectedBaseMesh(meshType: BaseMeshType) {
+    const option = baseMeshOption(meshType);
+
+    setSelectedBaseMeshType(meshType);
+    setMainMeshDraft((current) => ({
+      ...current,
+      diameter: option.diameter,
+      spacing: option.spacing
+    }));
   }
 
   function finishMainMeshModal() {
-    updateActiveMeshZoneParameters(mainMeshDraft);
-    const didActivate = activateBaseMeshOnWorkingSlab(mainMeshDraft);
+    if (!baseMeshRecommendation) {
+      return;
+    }
+
+    const selectedOption = baseMeshOption(selectedBaseMeshType);
+    const nextSelection = selectionFromOption(selectedOption, baseMeshRecommendation);
+    const slabWithSelection = {
+      ...slabGeometry,
+      baseMeshSelection: {
+        ...nextSelection,
+        selectedAt: new Date().toISOString()
+      },
+      dwgUnderlay: slabGeometry.dwgUnderlay
+        ? {
+            ...slabGeometry.dwgUnderlay,
+            reviewOnly: false
+          }
+        : slabGeometry.dwgUnderlay
+    };
+    const optimizedLayout = findMostEfficientLayoutDirection(
+      slabWithSelection,
+      {
+        ...mainMeshDraft,
+        diameter: selectedOption.diameter,
+        overlapX: 400,
+        overlapY: 400,
+        sheetLength: 6000,
+        sheetWidth: 2500,
+        spacing: selectedOption.spacing
+      },
+      activeMeshZone.geometry
+    );
+    const finalSettings = {
+      ...mainMeshDraft,
+      diameter: selectedOption.diameter,
+      orientation: optimizedLayout.selectedOrientation,
+      overlapX: 400,
+      overlapY: 400,
+      sheetLength: 6000,
+      sheetWidth: 2500,
+      spacing: selectedOption.spacing
+    };
+    const wastePercent =
+      optimizedLayout.rawSheetArea > 0
+        ? (optimizedLayout.cutWasteArea / optimizedLayout.rawSheetArea) * 100
+        : 0;
+    const directionLabel =
+      optimizedLayout.selectedOrientation === "horizontal" ? "אופקי" : "אנכי";
+
+    setMainMeshDraft(finalSettings);
+    updateActiveMeshZoneParameters(finalSettings);
+    const didActivate = activateBaseMeshOnWorkingSlab(finalSettings);
 
     if (didActivate) {
+      setBaseMeshSelection(nextSelection);
       setIsMainMeshModalOpen(false);
-      setMainMeshStep(0);
+      setBaseMeshToast(
+        `בוצעה פריסה אופטימלית בכיוון ${directionLabel} המיושרת לציר הסמך שסומן. פחת חומר חזוי: ${wastePercent.toFixed(1)}%.`
+      );
     }
   }
 
@@ -1884,7 +2139,7 @@ export function MeshInspectorPanel({
                         onClick={() => {
                           const didGenerate = generateSlabFromVisibleLayers();
                           if (didGenerate) {
-                            setActiveDock("slab");
+                            setActiveDock("constraints");
                           }
                         }}
                       >
@@ -2002,7 +2257,7 @@ export function MeshInspectorPanel({
                     onClick={() => {
                       const didGenerate = generateSlabFromVisibleLayers();
                       if (didGenerate) {
-                        setActiveDock("slab");
+                        setActiveDock("constraints");
                       }
                     }}
                   >
@@ -2114,23 +2369,38 @@ export function MeshInspectorPanel({
               Main Mesh
             </div>
             <p className="text-xs leading-5 text-muted-foreground">
-              Add the main mesh first. Configure diameter, spacing, sheet size,
-              overlap and anchorage, then click Done to place it on the slab.
+              Final-stage control. Configure the recommended Q8/Q10/Q12 base
+              mesh only after the analytical heatmap has been reviewed.
             </p>
             <div className="grid grid-cols-1 gap-2">
+              {!canGenerateReinforcement ? (
+                <div className="rounded-xl border border-dashed p-3 text-xs leading-5 text-muted-foreground">
+                  Locked until Step 4-5 produces heatmap evidence.
+                </div>
+              ) : null}
               {!hasActiveSlabBoundary ? (
                 <div className="rounded-xl border border-dashed p-3 text-xs leading-5 text-muted-foreground">
                   Define the working slab before adding main mesh.
                 </div>
               ) : null}
-              {hasActiveSlabBoundary && !hasMainMeshApplied ? (
+              {canGenerateReinforcement && hasActiveSlabBoundary && !hasMainMeshApplied ? (
                 <Button
                   className="w-full"
                   type="button"
                   variant="secondary"
                   onClick={openMainMeshModal}
                 >
-                  Add Main Mesh
+                  ייצור רשת בסיס
+                </Button>
+              ) : null}
+              {hasMainMeshApplied ? (
+                <Button
+                  className="w-full"
+                  type="button"
+                  variant="destructive"
+                  onClick={clearBaseMeshFromWorkingSlab}
+                >
+                  נקה רשת בסיס
                 </Button>
               ) : null}
             </div>
@@ -2360,290 +2630,134 @@ export function MeshInspectorPanel({
         </CardContent>
       </Card>
     </aside>
+    {baseMeshToast ? (
+      <div className="fixed right-6 top-6 z-50 max-w-md rounded-2xl border border-emerald-300/30 bg-emerald-300/15 p-4 text-right text-sm leading-6 text-emerald-50 shadow-2xl shadow-black/40 backdrop-blur">
+        <div className="font-semibold text-foreground">פריסת רשת בסיס</div>
+        <div className="mt-1">{baseMeshToast}</div>
+        <Button
+          className="mt-3 h-8"
+          type="button"
+          variant="outline"
+          onClick={() => setBaseMeshToast(null)}
+        >
+          סגור
+        </Button>
+      </div>
+    ) : null}
     {isMainMeshModalOpen ? (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 backdrop-blur-sm">
-        <div className="w-full max-w-2xl overflow-hidden rounded-3xl border border-primary/20 bg-card shadow-2xl shadow-black/50">
+        <div className="w-full max-w-2xl overflow-hidden rounded-3xl border border-primary/20 bg-card text-right shadow-2xl shadow-black/50">
           <div className="border-b bg-background/60 p-5">
             <div className="text-xs font-medium uppercase tracking-[0.18em] text-primary">
-              Add Main Mesh
+              Step 6a
             </div>
             <div className="mt-2 flex items-center justify-between gap-4">
-              <div>
-                <h3 className="text-xl font-semibold text-foreground">
-                  Main slab mesh setup
-                </h3>
-                <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                  Step {mainMeshStep + 1} of 4
-                </p>
-              </div>
               <Button
                 type="button"
                 variant="outline"
                 onClick={() => setIsMainMeshModalOpen(false)}
               >
-                Close
+                ביטול
               </Button>
-            </div>
-            <div className="mt-4 grid grid-cols-4 gap-2">
-              {["Steel", "Sheet", "Placement", "Summary"].map((label, index) => (
-                <div
-                  key={label}
-                  className={`rounded-full px-3 py-1 text-center text-xs font-medium ${
-                    mainMeshStep === index
-                      ? "bg-primary text-primary-foreground"
-                      : index < mainMeshStep
-                        ? "bg-primary/15 text-primary"
-                        : "bg-muted text-muted-foreground"
-                  }`}
-                >
-                  {label}
-                </div>
-              ))}
+              <div>
+                <h3 className="text-2xl font-semibold text-foreground">
+                  הגדרת רשת בסיס לתקרה
+                </h3>
+                <p className="mt-1 text-sm leading-6 text-muted-foreground">
+                  בחירת רשת בסיס לפי העומס הדומיננטי מתוך נתוני STRAP בתוך גבול התקרה.
+                </p>
+              </div>
             </div>
           </div>
 
-          <div className="min-h-[360px] space-y-5 p-5">
-            {mainMeshStep === 0 ? (
-              <div className="space-y-5">
-                <div>
-                  <h4 className="text-lg font-semibold">Steel definition</h4>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    Select the main bar diameter and spacing.
-                  </p>
-                </div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <Label>Diameter</Label>
-                    <Select
-                      value={String(mainMeshDraft.diameter)}
-                      onValueChange={(value) =>
-                        updateMainMeshDraft({
-                          diameter: Number(
-                            value
-                          ) as BaseMeshSettings["diameter"]
-                        })
-                      }
-                    >
-                      <SelectTrigger>
-                        <span>{mainMeshDraft.diameter} mm</span>
-                      </SelectTrigger>
-                      <SelectContent>
-                        {diameterOptions.map((diameter) => (
-                          <SelectItem key={diameter} value={String(diameter)}>
-                            {diameter} mm
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="space-y-2">
-                    <Label>Spacing / Gap</Label>
-                    <Select
-                      value={String(mainMeshDraft.spacing)}
-                      onValueChange={(value) =>
-                        updateMainMeshDraft({
-                          spacing: Number(value) as BaseMeshSettings["spacing"]
-                        })
-                      }
-                    >
-                      <SelectTrigger>
-                        <span>{mainMeshDraft.spacing} mm</span>
-                      </SelectTrigger>
-                      <SelectContent>
-                        {spacingOptions.map((spacing) => (
-                          <SelectItem key={spacing} value={String(spacing)}>
-                            {spacing} mm
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-              </div>
-            ) : null}
-
-            {mainMeshStep === 1 ? (
-              <div className="space-y-5">
-                <div>
-                  <h4 className="text-lg font-semibold">Sheet geometry</h4>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    Define sheet dimensions and lap overlap.
-                  </p>
-                </div>
-                <div className="grid grid-cols-2 gap-4">
-                  {[
-                    ["sheetWidth", "Sheet Width", 500, 100],
-                    ["sheetLength", "Sheet Length", 1000, 100],
-                    ["overlapX", "Overlap X", 0, 50],
-                    ["overlapY", "Overlap Y", 0, 50]
-                  ].map(([field, label, min, step]) => (
-                    <div key={field} className="space-y-2">
-                      <Label htmlFor={`main-${field}`}>{label}</Label>
-                      <Input
-                        id={`main-${field}`}
-                        min={min as number}
-                        step={step as number}
-                        type="number"
-                        value={String(
-                          mainMeshDraft[field as keyof BaseMeshSettings]
-                        )}
-                        onChange={(event) =>
-                          updateMainMeshDraft({
-                            [field]: draftNumber(
-                              event.target.value,
-                              mainMeshDraft[field as keyof BaseMeshSettings] as number
-                            )
-                          } as BaseMeshSettingsUpdate)
-                        }
-                      />
+          <div className="space-y-5 p-5">
+            {baseMeshRecommendation ? (
+              <>
+                <div className="grid gap-3 md:grid-cols-3">
+                  <div className="rounded-2xl border bg-background/60 p-4">
+                    <div className="text-xs text-muted-foreground">
+                      העומס הנפוץ לכיסוי
                     </div>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-
-            {mainMeshStep === 2 ? (
-              <div className="space-y-5">
-                <div>
-                  <h4 className="text-lg font-semibold">Placement rules</h4>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    Set anchorage, origin, and preferred orientation.
-                  </p>
-                </div>
-                <div className="space-y-4">
-                  <div className="space-y-2">
-                    <Label htmlFor="main-wall-anchorage">
-                      Wall Anchorage Depth
-                    </Label>
-                    <Input
-                      id="main-wall-anchorage"
-                      min={0}
-                      step={25}
-                      type="number"
-                      value={mainMeshDraft.wallAnchorageDepth}
-                      onChange={(event) =>
-                        updateMainMeshDraft({
-                          wallAnchorageDepth: draftNumber(
-                            event.target.value,
-                            mainMeshDraft.wallAnchorageDepth
-                          )
-                        })
-                      }
-                    />
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <Label>Origin Corner</Label>
-                      <Select
-                        value={mainMeshDraft.originCorner}
-                        onValueChange={(value: BaseMeshSettings["originCorner"]) =>
-                          updateMainMeshDraft({ originCorner: value })
-                        }
-                      >
-                        <SelectTrigger>
-                          <span>{mainMeshDraft.originCorner}</span>
-                        </SelectTrigger>
-                        <SelectContent>
-                          {originOptions.map((origin) => (
-                            <SelectItem key={origin} value={origin}>
-                              {origin}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                    <div className="mt-2 text-2xl font-semibold text-foreground">
+                      {roundedAs(baseMeshRecommendation.dominantRequiredAs)} ממ״ר/מטר
                     </div>
-                    <div className="space-y-2">
-                      <Label>Orientation Preference</Label>
-                      <ToggleGroup
-                        className="grid w-full grid-cols-2"
-                        value={mainMeshDraft.orientation}
-                        onValueChange={(value) => {
-                          if (value === "horizontal" || value === "vertical") {
-                            updateMainMeshDraft({ orientation: value });
-                          }
-                        }}
-                      >
-                        <ToggleGroupItem value="horizontal">
-                          Horizontal
-                        </ToggleGroupItem>
-                        <ToggleGroupItem value="vertical">
-                          Vertical
-                        </ToggleGroupItem>
-                      </ToggleGroup>
+                  </div>
+                  <div className="rounded-2xl border bg-background/60 p-4">
+                    <div className="text-xs text-muted-foreground">
+                      אלמנטים בחישוב
+                    </div>
+                    <div className="mt-2 text-2xl font-semibold text-foreground">
+                      {baseMeshRecommendation.sourceElementCount}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border bg-background/60 p-4">
+                    <div className="text-xs text-muted-foreground">
+                      כיסוי משוער
+                    </div>
+                    <div className="mt-2 text-2xl font-semibold text-foreground">
+                      {Math.round(baseMeshRecommendation.coveragePercent)}%
                     </div>
                   </div>
                 </div>
-              </div>
-            ) : null}
 
-            {mainMeshStep === 3 ? (
-              <div className="space-y-5">
-                <div>
-                  <h4 className="text-lg font-semibold">Summary</h4>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    Review the main mesh before placing it on the canvas.
+                <div className="rounded-3xl border border-emerald-300/30 bg-emerald-300/10 p-5">
+                  <div className="text-xs font-medium uppercase tracking-[0.16em] text-emerald-100">
+                    המלצת מערכת
+                  </div>
+                  <div className="mt-2 text-xl font-semibold text-foreground">
+                    המלצת המערכת: רשת בסיס {baseMeshRecommendation.meshType}
+                  </div>
+                  <p className="mt-2 text-sm leading-6 text-emerald-50/80">
+                    {baseMeshOption(baseMeshRecommendation.meshType).label} - מכסה כ-
+                    {Math.round(baseMeshRecommendation.coveragePercent)}% משטח התקרה
+                    באופן אופטימלי, מבלי לתכנן את כל התקרה לפי שיאים מקומיים.
                   </p>
                 </div>
-                <div className="grid grid-cols-2 gap-3 text-sm">
-                  <div className="rounded-2xl border bg-background/60 p-3">
-                    Ø{mainMeshDraft.diameter}@{mainMeshDraft.spacing}
-                  </div>
-                  <div className="rounded-2xl border bg-background/60 p-3">
-                    Sheet {mainMeshDraft.sheetWidth} x{" "}
-                    {mainMeshDraft.sheetLength} mm
-                  </div>
-                  <div className="rounded-2xl border bg-background/60 p-3">
-                    Overlap {mainMeshDraft.overlapX} / {mainMeshDraft.overlapY} mm
-                  </div>
-                  <div className="rounded-2xl border bg-background/60 p-3">
-                    Anchorage {mainMeshDraft.wallAnchorageDepth} mm
-                  </div>
-                  <div className="rounded-2xl border bg-background/60 p-3">
-                    Origin {mainMeshDraft.originCorner}
-                  </div>
-                  <div className="rounded-2xl border bg-background/60 p-3">
-                    Orientation {mainMeshDraft.orientation}
-                  </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="base-mesh-type">בחירה ידנית של סוג רשת</Label>
+                  <Select
+                    value={selectedBaseMeshType}
+                    onValueChange={(value: BaseMeshType) =>
+                      updateSelectedBaseMesh(value)
+                    }
+                  >
+                    <SelectTrigger id="base-mesh-type">
+                      <span>{baseMeshOption(selectedBaseMeshType).label}</span>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {baseMeshOptions.map((option) => (
+                        <SelectItem key={option.meshType} value={option.meshType}>
+                          {option.label} - קיבולת {option.capacity} ממ״ר/מטר
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
-                <div className="rounded-2xl border border-primary/20 bg-primary/10 p-3 text-sm leading-6 text-foreground">
-                  Estimated sheets: {mainMeshDraftComparison.active.sheetCount} |
-                  Waste:{" "}
-                  {squareMeters(mainMeshDraftComparison.active.cutWasteArea)}m²
-                </div>
+              </>
+            ) : (
+              <div className="rounded-2xl border border-dashed p-5 text-sm leading-6 text-muted-foreground">
+                לא נמצאו נתוני STRAP מספריים מתאימים בתוך גבול התקרה. יש להריץ קודם
+                את שלב האנליזה ולוודא שקבצי STRAP/FEM נטענו.
               </div>
-            ) : null}
+            )}
           </div>
 
           <div className="flex items-center justify-between border-t bg-background/50 p-5">
             <Button
-              disabled={mainMeshStep === 0}
               type="button"
               variant="outline"
-              onClick={() => setMainMeshStep((step) => Math.max(0, step - 1))}
+              onClick={() => setIsMainMeshModalOpen(false)}
             >
-              Back
+              ביטול
             </Button>
-            <div className="flex gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setIsMainMeshModalOpen(false)}
-              >
-                Cancel
-              </Button>
-              {mainMeshStep < 3 ? (
-                <Button
-                  type="button"
-                  onClick={() => setMainMeshStep((step) => Math.min(3, step + 1))}
-                >
-                  Next
-                </Button>
-              ) : (
-                <Button type="button" onClick={finishMainMeshModal}>
-                  Done
-                </Button>
-              )}
-            </div>
+            <Button
+              disabled={!baseMeshRecommendation}
+              type="button"
+              onClick={finishMainMeshModal}
+            >
+              המשך ופרוס רשת בסיס
+            </Button>
           </div>
         </div>
       </div>

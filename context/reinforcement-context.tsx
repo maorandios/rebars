@@ -17,6 +17,8 @@ import { intersectPolygons } from "@/lib/geometry/polygon-boolean";
 import type {
   AnalysisEvidenceCell,
   AnalysisIsland,
+  BaseMeshRecommendation,
+  BaseMeshSelection,
   BaseMeshSettings,
   BaseMeshSettingsUpdate,
   CadLineEntity,
@@ -25,6 +27,7 @@ import type {
   ExtraMeshDesignZone,
   ExtraMeshSchedule,
   ExtraMeshScheduleType,
+  EngineeringPipelineStep,
   MeshZone,
   MeshZoneUpdate,
   Point,
@@ -38,7 +41,8 @@ import type {
   StrapAnalysisDebug,
   StrapExtraMeshZone,
   StrapNumericalData,
-  StrapOverloadedElement
+  StrapOverloadedElement,
+  StructuralSupportAxis
 } from "@/types/structure";
 
 const BASE_CAPACITY = 393;
@@ -80,6 +84,10 @@ type StrapElementCell = {
 
 type ReinforcementContextValue = {
   slabGeometry: SlabGeometry;
+  pipelineSteps: EngineeringPipelineStep[];
+  currentPipelineStepId: EngineeringPipelineStep["id"];
+  canRunAnalyticalEvaluation: boolean;
+  canGenerateReinforcement: boolean;
   meshZones: MeshZone[];
   activeZoneId: string;
   activeMeshZone: MeshZone;
@@ -93,6 +101,8 @@ type ReinforcementContextValue = {
   designAreaDrawingPurpose: DesignAreaDrawingPurpose;
   boundaryDraftPoints: Point[];
   designAreaDraftPoints: Point[];
+  isDrawingSupportAxis: boolean;
+  supportAxisDraftPoints: Point[];
   activeDxfUnderlayId: string | null;
   analysisViewMode: AnalysisViewMode;
   showRawStrapLayers: boolean;
@@ -127,6 +137,11 @@ type ReinforcementContextValue = {
   cancelDesignAreaDraw: () => void;
   addDesignAreaDraftPoint: (point: Point) => void;
   finishDesignAreaDraft: () => boolean;
+  beginSupportAxisDraw: () => void;
+  cancelSupportAxisDraw: () => void;
+  addSupportAxisDraftPoint: (point: Point) => void;
+  finishSupportAxisDraft: () => boolean;
+  deleteSupportAxis: (axisId: string) => void;
   commitDesignAreaPolygon: (
     polygon: Point[],
     purpose?: SlabDesignAreaPurpose,
@@ -155,8 +170,13 @@ type ReinforcementContextValue = {
   runThreeWayAnalysis: () => number;
   clearStrapAnalysis: () => void;
   generateRawDeficitZones: () => number;
+  getBaseMeshRecommendation: () => BaseMeshRecommendation | null;
+  setBaseMeshSelection: (
+    selection: Omit<BaseMeshSelection, "selectedAt">
+  ) => void;
   generateSlabFromVisibleLayers: () => boolean;
   activateBaseMeshOnWorkingSlab: (patch?: BaseMeshSettingsUpdate) => boolean;
+  clearBaseMeshFromWorkingSlab: () => boolean;
   setActiveZoneId: (zoneId: string) => void;
   setUnderlayLayerVisible: (layerName: string, visible: boolean) => void;
   updateActiveMeshZone: (patch: MeshZoneUpdate) => void;
@@ -1586,6 +1606,309 @@ function boundaryFromUnderlayBounds(slabGeometry: SlabGeometry) {
   ];
 }
 
+function hasValidatedHeatmap(slabGeometry: SlabGeometry) {
+  return Boolean(
+    slabGeometry.analysisEvidenceCells?.length ||
+      slabGeometry.analysisIslands?.length ||
+      slabGeometry.strapOverloadedElements?.length
+  );
+}
+
+function derivePipelineState(slabGeometry: SlabGeometry): {
+  canGenerateReinforcement: boolean;
+  canRunAnalyticalEvaluation: boolean;
+  currentPipelineStepId: EngineeringPipelineStep["id"];
+  pipelineSteps: EngineeringPipelineStep[];
+} {
+  const hasImportedData = Boolean(
+    slabGeometry.dwgUnderlay?.importedFileName ||
+      slabGeometry.dxfUnderlays?.length ||
+      slabGeometry.strapLayerX ||
+      slabGeometry.strapLayerY ||
+      slabGeometry.strapNumericalData?.length
+  );
+  const hasStrapInputs = Boolean(
+    slabGeometry.strapLayerX &&
+      slabGeometry.strapLayerY &&
+      slabGeometry.strapNumericalData?.length
+  );
+  const hasConstraints = Boolean(
+    slabGeometry.hasActiveSlabBoundary &&
+      (slabGeometry.supportAxes?.length ?? 0) > 0
+  );
+  const hasHeatmap = hasValidatedHeatmap(slabGeometry);
+  const canRunAnalyticalEvaluation = hasStrapInputs && hasConstraints;
+  const canGenerateReinforcement = hasHeatmap && hasConstraints;
+  const currentPipelineStepId: EngineeringPipelineStep["id"] = !hasImportedData
+    ? "ingestion-cleanup"
+    : !hasConstraints
+      ? "constraints"
+      : !hasHeatmap
+        ? "analytical-evaluation"
+        : "reinforcement-generation";
+  const completeBefore = (stepId: EngineeringPipelineStep["id"]) => {
+    switch (stepId) {
+      case "ingestion-cleanup":
+        return hasImportedData;
+      case "constraints":
+        return hasConstraints;
+      case "analytical-evaluation":
+        return hasHeatmap;
+      case "reinforcement-generation":
+        return canGenerateReinforcement;
+    }
+  };
+
+  return {
+    canGenerateReinforcement,
+    canRunAnalyticalEvaluation,
+    currentPipelineStepId,
+    pipelineSteps: [
+      {
+        id: "ingestion-cleanup",
+        label: "1-2 Data Ingestion & Cleanup",
+        description: "Load DXF/STRAP/FEM files, then align and clean layers.",
+        isComplete: completeBefore("ingestion-cleanup"),
+        isCurrent: currentPipelineStepId === "ingestion-cleanup",
+        isLocked: false
+      },
+      {
+        id: "constraints",
+        label: "3 Constraints Mode",
+        description: "Define slab boundary, support axes, and void/opening zones.",
+        isComplete: completeBefore("constraints"),
+        isCurrent: currentPipelineStepId === "constraints",
+        isLocked: !hasImportedData
+      },
+      {
+        id: "analytical-evaluation",
+        label: "4-5 Analytical Heatmap",
+        description: "Compute max required As and review the heatmap only.",
+        isComplete: completeBefore("analytical-evaluation"),
+        isCurrent: currentPipelineStepId === "analytical-evaluation",
+        isLocked: !hasConstraints
+      },
+      {
+        id: "reinforcement-generation",
+        label: "6 Reinforcement Generation",
+        description: "Deploy base mesh and add-on zones after heatmap validation.",
+        isComplete: completeBefore("reinforcement-generation"),
+        isCurrent: currentPipelineStepId === "reinforcement-generation",
+        isLocked: !canGenerateReinforcement
+      }
+    ]
+  };
+}
+
+function sameSupportAxisPoint(first: Point, second: Point) {
+  return Math.abs(first.x - second.x) < 0.001 && Math.abs(first.y - second.y) < 0.001;
+}
+
+function sameSupportAxisGeometry(
+  axis: StructuralSupportAxis,
+  start: Point,
+  end: Point
+) {
+  return (
+    sameSupportAxisPoint(axis.start, start) &&
+    sameSupportAxisPoint(axis.end, end)
+  ) || (
+    sameSupportAxisPoint(axis.start, end) &&
+    sameSupportAxisPoint(axis.end, start)
+  );
+}
+
+function createSupportAxis(
+  index: number,
+  start: Point,
+  end: Point
+): StructuralSupportAxis {
+  return {
+    id: `SUPPORT-AXIS-${String(index).padStart(2, "0")}-${Date.now().toString(36)}`,
+    label: `Support axis ${index}`,
+    start,
+    end,
+    visible: true
+  };
+}
+
+function appendSupportAxis(
+  slabGeometry: SlabGeometry,
+  start: Point,
+  end: Point
+): SlabGeometry {
+  const supportAxes = slabGeometry.supportAxes ?? [];
+
+  if (supportAxes.some((axis) => sameSupportAxisGeometry(axis, start, end))) {
+    return slabGeometry;
+  }
+
+  return {
+    ...slabGeometry,
+    supportAxes: [
+      ...supportAxes,
+      createSupportAxis(supportAxes.length + 1, start, end)
+    ]
+  };
+}
+
+const baseMeshStandards = {
+  Q8: {
+    capacity: 251,
+    diameter: 8,
+    meshType: "Q8",
+    spacing: 200
+  },
+  Q10: {
+    capacity: 393,
+    diameter: 10,
+    meshType: "Q10",
+    spacing: 200
+  },
+  Q12: {
+    capacity: Math.round(steelAreaPerMeter(12, 200)),
+    diameter: 12,
+    meshType: "Q12",
+    spacing: 200
+  }
+} satisfies Record<
+  BaseMeshSelection["meshType"],
+  Pick<BaseMeshSelection, "capacity" | "diameter" | "meshType" | "spacing">
+>;
+
+function percentile(values: number[], ratio: number) {
+  if (values.length === 0) {
+    return 0;
+  }
+
+  const sorted = values.toSorted((a, b) => a - b);
+  const index = Math.max(
+    0,
+    Math.min(sorted.length - 1, Math.ceil(sorted.length * ratio) - 1)
+  );
+
+  return sorted[index];
+}
+
+function standardForRequiredAs(requiredAs: number) {
+  if (requiredAs <= baseMeshStandards.Q8.capacity) {
+    return baseMeshStandards.Q8;
+  }
+  if (requiredAs <= baseMeshStandards.Q10.capacity) {
+    return baseMeshStandards.Q10;
+  }
+
+  return baseMeshStandards.Q12;
+}
+
+function addRequiredAsValue(
+  valuesByElement: Map<string, number>,
+  elementId: string,
+  requiredAs: number
+) {
+  if (!Number.isFinite(requiredAs)) {
+    return;
+  }
+
+  valuesByElement.set(
+    elementId,
+    Math.max(valuesByElement.get(elementId) ?? 0, requiredAs)
+  );
+}
+
+function collectRequiredAsInsideSlab(slabGeometry: SlabGeometry) {
+  const numericalRows = slabGeometry.strapNumericalData ?? [];
+  const numericalDataByElement = new Map(
+    numericalRows.map((row) => [row.elementId, row])
+  );
+  const elementLabels = [
+    ...collectElementLabelsFromLayer("x", slabGeometry.strapLayerX),
+    ...collectElementLabelsFromLayer("y", slabGeometry.strapLayerY)
+  ];
+  const dxfIds = new Set(elementLabels.map((label) => label.elementId));
+  const idResolver = createStrapIdResolver(numericalDataByElement, dxfIds);
+  const valuesByElement = new Map<string, number>();
+  const boundary = slabGeometry.boundary;
+
+  for (const cell of [
+    ...reconstructStrapElementCells("x", slabGeometry.strapLayerX),
+    ...reconstructStrapElementCells("y", slabGeometry.strapLayerY)
+  ]) {
+    const row = numericalRows[cell.index];
+
+    if (row && pointInPolygon(polygonCenter(cell.polygon), boundary)) {
+      addRequiredAsValue(valuesByElement, row.elementId, row.maxRequiredAs);
+    }
+  }
+
+  for (const underlay of [slabGeometry.strapLayerX, slabGeometry.strapLayerY]) {
+    for (const candidate of underlay?.closedPolylines ?? []) {
+      const polygon = transformDxfPolygon(underlay, candidate.polygon);
+
+      if (!pointInPolygon(polygonCenter(polygon), boundary)) {
+        continue;
+      }
+
+      const dxfElementId = findElementIdInsidePolygon(underlay, polygon);
+      const row = dxfElementId ? idResolver.resolve(dxfElementId) : undefined;
+      const resolvedElementId = dxfElementId
+        ? idResolver.resolveElementId(dxfElementId)
+        : null;
+
+      if (row) {
+        addRequiredAsValue(
+          valuesByElement,
+          resolvedElementId ?? row.elementId,
+          row.maxRequiredAs
+        );
+      }
+    }
+  }
+
+  for (const label of elementLabels) {
+    if (!pointInPolygon(label.point, boundary)) {
+      continue;
+    }
+
+    const row = idResolver.resolve(label.elementId);
+    const resolvedElementId = idResolver.resolveElementId(label.elementId);
+
+    if (row) {
+      addRequiredAsValue(
+        valuesByElement,
+        resolvedElementId ?? row.elementId,
+        row.maxRequiredAs
+      );
+    }
+  }
+
+  return [...valuesByElement.values()];
+}
+
+function createBaseMeshRecommendation(
+  slabGeometry: SlabGeometry
+): BaseMeshRecommendation | null {
+  const requiredAsValues = collectRequiredAsInsideSlab(slabGeometry);
+
+  if (requiredAsValues.length === 0) {
+    return null;
+  }
+
+  const dominantRequiredAs = percentile(requiredAsValues, 0.75);
+  const standard = standardForRequiredAs(dominantRequiredAs);
+  const coveragePercent =
+    (requiredAsValues.filter((value) => value <= standard.capacity).length /
+      requiredAsValues.length) *
+    100;
+
+  return {
+    ...standard,
+    coveragePercent,
+    dominantRequiredAs,
+    sourceElementCount: requiredAsValues.length
+  };
+}
+
 export function ReinforcementProvider({ children }: { children: ReactNode }) {
   const [slabGeometry, setSlabGeometry] = useState<SlabGeometry>(() =>
     cloneSlabGeometry()
@@ -1618,8 +1941,16 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     useState<DesignAreaDrawingPurpose>("no-mesh");
   const [boundaryDraftPoints, setBoundaryDraftPoints] = useState<Point[]>([]);
   const [designAreaDraftPoints, setDesignAreaDraftPoints] = useState<Point[]>([]);
+  const [isDrawingSupportAxis, setIsDrawingSupportAxis] = useState(false);
+  const [supportAxisDraftPoints, setSupportAxisDraftPoints] = useState<Point[]>([]);
   const activeMeshZone =
     meshZones.find((zone) => zone.id === activeZoneId) ?? meshZones[0];
+  const {
+    canGenerateReinforcement,
+    canRunAnalyticalEvaluation,
+    currentPipelineStepId,
+    pipelineSteps
+  } = useMemo(() => derivePipelineState(slabGeometry), [slabGeometry]);
 
   const updateActiveMeshZone = useCallback(
     (patch: MeshZoneUpdate) => {
@@ -1659,9 +1990,11 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
   const beginDrawingZone = useCallback(() => {
     setIsDrawingZone(true);
     setIsDrawingDesignArea(false);
+    setIsDrawingSupportAxis(false);
     setDesignAreaDrawingMode(null);
     setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
+    setSupportAxisDraftPoints([]);
   }, []);
 
   const cancelDrawingZone = useCallback(() => {
@@ -1694,6 +2027,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
     setIsDrawingZone(false);
+    setIsDrawingSupportAxis(false);
+    setSupportAxisDraftPoints([]);
   }, []);
 
   const cancelBoundaryTrace = useCallback(() => {
@@ -1717,6 +2052,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setIsEditingBoundary(false);
     setIsDrawingZone(false);
     setBoundaryDraftPoints([]);
+    setIsDrawingSupportAxis(false);
+    setSupportAxisDraftPoints([]);
   }, []);
 
   const cancelDesignAreaDraw = useCallback(() => {
@@ -1762,6 +2099,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       meshInteriorBoundary: undefined,
       designAreas: [],
       openings: [],
+      supportAxes: [],
       structuralElements: []
     };
     const nextMainZone = createMainZoneForSlab(
@@ -1861,6 +2199,68 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
   const finishDesignAreaDraft = useCallback(() => {
     return commitDesignAreaPolygon(designAreaDraftPoints, designAreaDrawingPurpose);
   }, [commitDesignAreaPolygon, designAreaDraftPoints, designAreaDrawingPurpose]);
+
+  const beginSupportAxisDraw = useCallback(() => {
+    setSupportAxisDraftPoints([]);
+    setIsDrawingSupportAxis(true);
+    setIsDrawingBoundary(false);
+    setIsEditingBoundary(false);
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
+    setDesignAreaDraftPoints([]);
+    setIsDrawingZone(false);
+    setBoundaryDraftPoints([]);
+  }, []);
+
+  const cancelSupportAxisDraw = useCallback(() => {
+    setSupportAxisDraftPoints([]);
+    setIsDrawingSupportAxis(false);
+  }, []);
+
+  const addSupportAxisDraftPoint = useCallback(
+    (point: Point) => {
+      if (!slabGeometry.hasActiveSlabBoundary) {
+        return;
+      }
+
+      setSupportAxisDraftPoints((current) => {
+        if (current.length === 0) {
+          return [point];
+        }
+
+        setSlabGeometry((currentGeometry) =>
+          appendSupportAxis(currentGeometry, current[0], point)
+        );
+        setIsDrawingSupportAxis(false);
+        return [];
+      });
+    },
+    [slabGeometry.hasActiveSlabBoundary]
+  );
+
+  const finishSupportAxisDraft = useCallback(() => {
+    if (!slabGeometry.hasActiveSlabBoundary || supportAxisDraftPoints.length < 2) {
+      return false;
+    }
+
+    setSlabGeometry((current) =>
+      appendSupportAxis(current, supportAxisDraftPoints[0], supportAxisDraftPoints[1])
+    );
+    setSupportAxisDraftPoints([]);
+    setIsDrawingSupportAxis(false);
+    return true;
+  }, [
+    slabGeometry.hasActiveSlabBoundary,
+    supportAxisDraftPoints
+  ]);
+
+  const deleteSupportAxis = useCallback((axisId: string) => {
+    setSlabGeometry((current) => ({
+      ...current,
+      supportAxes: (current.supportAxes ?? []).filter((axis) => axis.id !== axisId)
+    }));
+  }, []);
 
   const beginBoundaryEdit = useCallback(() => {
     if (!slabGeometry.hasActiveSlabBoundary) {
@@ -2251,6 +2651,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
     setBoundaryDraftPoints([]);
+    setIsDrawingSupportAxis(false);
+    setSupportAxisDraftPoints([]);
   }, []);
 
   const importSlabGeometry = useCallback(
@@ -2497,6 +2899,10 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const runThreeWayAnalysis = useCallback(() => {
+    if (!canRunAnalyticalEvaluation) {
+      return 0;
+    }
+
     const numericalDataByElement = new Map(
       (slabGeometry.strapNumericalData ?? []).map((row) => [
         row.elementId,
@@ -2634,6 +3040,7 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     slabGeometry.strapLayerY,
     slabGeometry.strapNumericalData,
     slabGeometry.openings,
+    canRunAnalyticalEvaluation,
     activeMeshZone.parameters,
     meshZones
   ]);
@@ -2669,6 +3076,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setDesignAreaDrawingMode(null);
     setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
+    setIsDrawingSupportAxis(false);
+    setSupportAxisDraftPoints([]);
   }, [slabGeometry.designAreas]);
 
   const generateRawDeficitZones = useCallback(() => {
@@ -2685,6 +3094,24 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
 
     return rawDeficitZones.length;
   }, [slabGeometry.boundary, slabGeometry.strapLayerX, slabGeometry.strapLayerY]);
+
+  const getBaseMeshRecommendation = useCallback(
+    () => createBaseMeshRecommendation(slabGeometry),
+    [slabGeometry]
+  );
+
+  const setBaseMeshSelection = useCallback(
+    (selection: Omit<BaseMeshSelection, "selectedAt">) => {
+      setSlabGeometry((current) => ({
+        ...current,
+        baseMeshSelection: {
+          ...selection,
+          selectedAt: new Date().toISOString()
+        }
+      }));
+    },
+    []
+  );
 
   const generateSlabFromVisibleLayers = useCallback(() => {
     const tracedBoundary =
@@ -2742,12 +3169,18 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setDesignAreaDrawingMode(null);
     setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
+    setIsDrawingSupportAxis(false);
+    setSupportAxisDraftPoints([]);
     setBoundaryDraftPoints([]);
     return true;
   }, [activeMeshZone.parameters, boundaryDraftPoints, slabGeometry]);
 
   const activateBaseMeshOnWorkingSlab = useCallback((patch?: BaseMeshSettingsUpdate) => {
-    if (!slabGeometry.hasActiveSlabBoundary || !slabGeometry.dwgUnderlay) {
+    if (
+      !canGenerateReinforcement ||
+      !slabGeometry.hasActiveSlabBoundary ||
+      !slabGeometry.dwgUnderlay
+    ) {
       return false;
     }
     const nextParameters = {
@@ -2782,9 +3215,42 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setDesignAreaDrawingMode(null);
     setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
+    setIsDrawingSupportAxis(false);
+    setSupportAxisDraftPoints([]);
     setBoundaryDraftPoints([]);
     return true;
-  }, [activeMeshZone.parameters, slabGeometry]);
+  }, [activeMeshZone.parameters, canGenerateReinforcement, slabGeometry]);
+
+  const clearBaseMeshFromWorkingSlab = useCallback(() => {
+    if (!slabGeometry.hasActiveSlabBoundary || !slabGeometry.dwgUnderlay) {
+      return false;
+    }
+
+    setSlabGeometry((current) => ({
+      ...current,
+      baseMeshSelection: undefined,
+      dwgUnderlay: current.dwgUnderlay
+        ? {
+            ...current.dwgUnderlay,
+            reviewOnly: true
+          }
+        : current.dwgUnderlay
+    }));
+    setActiveZoneId("ZONE-MAIN");
+    setSelectedDesignAreaId(null);
+    setEditingDesignAreaId(null);
+    setIsDrawingZone(false);
+    setIsDrawingBoundary(false);
+    setIsEditingBoundary(false);
+    setIsDrawingDesignArea(false);
+    setDesignAreaDrawingMode(null);
+    setDesignAreaDrawingPurpose("no-mesh");
+    setDesignAreaDraftPoints([]);
+    setIsDrawingSupportAxis(false);
+    setSupportAxisDraftPoints([]);
+    setBoundaryDraftPoints([]);
+    return true;
+  }, [slabGeometry.dwgUnderlay, slabGeometry.hasActiveSlabBoundary]);
 
   const setUnderlayLayerVisible = useCallback(
     (layerName: string, visible: boolean) => {
@@ -2825,6 +3291,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     setDesignAreaDrawingMode(null);
     setDesignAreaDrawingPurpose("no-mesh");
     setDesignAreaDraftPoints([]);
+    setIsDrawingSupportAxis(false);
+    setSupportAxisDraftPoints([]);
     setBoundaryDraftPoints([]);
   }, []);
 
@@ -2842,6 +3310,10 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
   const value = useMemo(
     () => ({
       slabGeometry,
+      pipelineSteps,
+      currentPipelineStepId,
+      canRunAnalyticalEvaluation,
+      canGenerateReinforcement,
       meshZones,
       activeZoneId,
       activeMeshZone,
@@ -2855,6 +3327,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       designAreaDrawingPurpose,
       boundaryDraftPoints,
       designAreaDraftPoints,
+      isDrawingSupportAxis,
+      supportAxisDraftPoints,
       activeDxfUnderlayId,
       analysisViewMode,
       showRawStrapLayers,
@@ -2886,13 +3360,21 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       cancelDesignAreaDraw,
       addDesignAreaDraftPoint,
       finishDesignAreaDraft,
+      beginSupportAxisDraw,
+      cancelSupportAxisDraw,
+      addSupportAxisDraftPoint,
+      finishSupportAxisDraft,
+      deleteSupportAxis,
       commitDesignAreaPolygon,
       addDxfUnderlay,
       activateBaseMeshOnWorkingSlab,
       deleteDxfUnderlayById,
       generateRawDeficitZones,
+      getBaseMeshRecommendation,
+      setBaseMeshSelection,
       generateSlabFromVisibleLayers,
       importSlabGeometry,
+      clearBaseMeshFromWorkingSlab,
       setActiveZoneId,
       setActiveDxfUnderlayId,
       setDxfUnderlayLayerVisible,
@@ -2911,6 +3393,10 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
     }),
     [
       slabGeometry,
+      pipelineSteps,
+      currentPipelineStepId,
+      canRunAnalyticalEvaluation,
+      canGenerateReinforcement,
       meshZones,
       activeZoneId,
       activeMeshZone,
@@ -2924,6 +3410,8 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       designAreaDrawingPurpose,
       boundaryDraftPoints,
       designAreaDraftPoints,
+      isDrawingSupportAxis,
+      supportAxisDraftPoints,
       activeDxfUnderlayId,
       analysisViewMode,
       showRawStrapLayers,
@@ -2955,13 +3443,21 @@ export function ReinforcementProvider({ children }: { children: ReactNode }) {
       cancelDesignAreaDraw,
       addDesignAreaDraftPoint,
       finishDesignAreaDraft,
+      beginSupportAxisDraw,
+      cancelSupportAxisDraw,
+      addSupportAxisDraftPoint,
+      finishSupportAxisDraft,
+      deleteSupportAxis,
       commitDesignAreaPolygon,
       addDxfUnderlay,
       activateBaseMeshOnWorkingSlab,
       deleteDxfUnderlayById,
       generateRawDeficitZones,
+      getBaseMeshRecommendation,
+      setBaseMeshSelection,
       generateSlabFromVisibleLayers,
       importSlabGeometry,
+      clearBaseMeshFromWorkingSlab,
       setUnderlayLayerVisible,
       setActiveDxfUnderlayId,
       setDxfUnderlayLayerVisible,

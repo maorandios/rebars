@@ -65,17 +65,17 @@ export default function WorkspacePage() {
     setInspectorContext(
       dock === "dxf"
         ? { type: "dxf" }
-        : dock === "slab"
+        : dock === "constraints"
           ? { type: "slab" }
           : { type: "mesh" }
     );
   };
 
   const dockItems: { id: DockSection; label: string }[] = [
-    { id: "dxf", label: "DXF" },
-    { id: "slab", label: "SLAB" },
-    { id: "mesh", label: "MESH" },
-    { id: "analysis", label: "אנליזה" }
+    { id: "dxf", label: "1-2 Data" },
+    { id: "constraints", label: "3 Constraints" },
+    { id: "analysis", label: "4-5 Heatmap" },
+    { id: "reinforcement", label: "6 Reinforcement" }
   ];
 
   return (
@@ -93,7 +93,7 @@ export default function WorkspacePage() {
         <section className="relative h-full min-w-0 flex-1 pb-20">
           <StructureCanvas />
         </section>
-        {activeDock !== "dxf" && activeDock !== "analysis" ? (
+        {activeDock === "constraints" || activeDock === "reinforcement" ? (
           <MeshInspectorPanel
             activeDock={activeDock}
             inspectorContext={inspectorContext}

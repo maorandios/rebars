@@ -33,6 +33,12 @@ type SheetCandidate = {
   polygon: Polygon;
 };
 
+type SupportAlignedDirection = BaseMeshSettings["orientation"];
+type SupportAxisAnchor = {
+  coordinate: number;
+  id: string;
+};
+
 type ActiveLayoutSettings = BaseMeshSettings & {
   orientation: BaseMeshSettings["orientation"];
 };
@@ -49,6 +55,10 @@ type Span = {
 };
 
 const defaultPerimeterWallThickness = 400;
+const standardSheetLength = 6_000;
+const standardSheetWidth = 2_500;
+const supportAlignedOverlap = 400;
+const supportAlignedHalfOverlap = supportAlignedOverlap / 2;
 
 function normalizeSpan(span: Span): Span | null {
   const start = Math.max(0, Math.min(1, Math.min(span.start, span.end)));
@@ -327,6 +337,150 @@ export function createSheetRectangle(
   ];
 }
 
+function supportAxisDirection(axis: NonNullable<SlabGeometry["supportAxes"]>[number]) {
+  const dx = axis.end.x - axis.start.x;
+  const dy = axis.end.y - axis.start.y;
+
+  return Math.abs(dx) >= Math.abs(dy) ? "horizontal" : "vertical";
+}
+
+function samePoint(first: Point, second: Point) {
+  return Math.abs(first.x - second.x) < 0.001 && Math.abs(first.y - second.y) < 0.001;
+}
+
+function isSlabBoundaryZone(slabGeometry: SlabGeometry, zoneGeometry?: Polygon) {
+  if (!zoneGeometry) {
+    return true;
+  }
+
+  return (
+    zoneGeometry.length === slabGeometry.boundary.length &&
+    zoneGeometry.every((point, index) => samePoint(point, slabGeometry.boundary[index]))
+  );
+}
+
+function supportAxisAnchors(
+  slabGeometry: SlabGeometry,
+  direction: SupportAlignedDirection
+) {
+  const targetAxisDirection = direction === "horizontal" ? "horizontal" : "vertical";
+
+  return (slabGeometry.supportAxes ?? [])
+    .filter(
+      (supportAxis) =>
+        supportAxis.visible !== false &&
+        supportAxisDirection(supportAxis) === targetAxisDirection
+    )
+    .map<SupportAxisAnchor>((axis) => ({
+      coordinate:
+        targetAxisDirection === "horizontal"
+          ? (axis.start.y + axis.end.y) / 2
+          : (axis.start.x + axis.end.x) / 2,
+      id: axis.id
+    }));
+}
+
+function anchoredPositions(
+  min: number,
+  max: number,
+  size: number,
+  step: number,
+  anchorStart: number
+) {
+  const positions = [];
+  let current = anchorStart;
+
+  while (current > min) {
+    current -= step;
+  }
+
+  while (current + size < min) {
+    current += step;
+  }
+
+  for (let value = current; value <= max; value += step) {
+    positions.push(value);
+  }
+
+  if (positions.length === 0 || positions[positions.length - 1] + size < max) {
+    positions.push((positions.at(-1) ?? current) + step);
+  }
+
+  return positions;
+}
+
+function supportAlignedSettings(
+  settings: BaseMeshSettings,
+  orientation: SupportAlignedDirection
+): ActiveLayoutSettings {
+  return {
+    ...settings,
+    sheetLength: standardSheetLength,
+    sheetWidth: standardSheetWidth,
+    overlapX: supportAlignedOverlap,
+    overlapY: supportAlignedOverlap,
+    orientation
+  };
+}
+
+function generateSupportAlignedSheetCandidates(
+  bounds: Bounds,
+  settings: ActiveLayoutSettings,
+  supportAnchors: {
+    x: SupportAxisAnchor | null;
+    y: SupportAxisAnchor | null;
+  }
+) {
+  const isHorizontal = settings.orientation === "horizontal";
+  const activeWidth = isHorizontal ? standardSheetLength : standardSheetWidth;
+  const activeLength = isHorizontal ? standardSheetWidth : standardSheetLength;
+  const stepX = activeWidth - supportAlignedOverlap;
+  const stepY = activeLength - supportAlignedOverlap;
+  const anchorX =
+    supportAnchors.x
+      ? supportAnchors.x.coordinate - supportAlignedHalfOverlap
+      : bounds.minX;
+  const anchorY =
+    supportAnchors.y
+      ? supportAnchors.y.coordinate - supportAlignedHalfOverlap
+      : bounds.minY;
+  const xPositions = anchoredPositions(
+    bounds.minX,
+    bounds.maxX,
+    activeWidth,
+    stepX,
+    anchorX
+  );
+  const yPositions = anchoredPositions(
+    bounds.minY,
+    bounds.maxY,
+    activeLength,
+    stepY,
+    anchorY
+  );
+
+  return {
+    candidates: yPositions.flatMap((y, row) =>
+      xPositions.map((x, column) => ({
+        id: `MS-SA-${settings.orientation === "horizontal" ? "H" : "V"}-R${String(
+          row + 1
+        ).padStart(2, "0")}-C${String(column + 1).padStart(2, "0")}`,
+        row,
+        column,
+        x,
+        y,
+        activeWidth,
+        activeLength,
+        polygon: createSheetRectangle(x, y, activeWidth, activeLength)
+      }))
+    ),
+    overlapX: supportAlignedOverlap,
+    overlapY: supportAlignedOverlap,
+    stepX,
+    stepY
+  };
+}
+
 function optimizeAxisLayout(
   min: number,
   max: number,
@@ -512,7 +666,60 @@ export function generateBaseMeshLayout(
   zoneGeometry?: Polygon,
   exclusionPolygons: Polygon[] = []
 ): MeshSheetLayoutResult {
+  if (
+    slabGeometry.baseMeshSelection &&
+    slabGeometry.supportAxes?.length &&
+    isSlabBoundaryZone(slabGeometry, zoneGeometry)
+  ) {
+    return generateSupportAlignedLayout(
+      slabGeometry,
+      settings,
+      zoneGeometry,
+      exclusionPolygons
+    );
+  }
+
   return generateLayoutForOrientation(
+    slabGeometry,
+    settings,
+    zoneGeometry,
+    exclusionPolygons
+  );
+}
+
+export function findMostEfficientLayoutDirection(
+  slabGeometry: SlabGeometry,
+  settings: BaseMeshSettings,
+  zoneGeometry?: Polygon,
+  exclusionPolygons: Polygon[] = []
+) {
+  const horizontal = generateBestSupportAlignedLayoutForOrientation(
+    slabGeometry,
+    supportAlignedSettings(settings, "horizontal"),
+    zoneGeometry,
+    exclusionPolygons
+  );
+  const vertical = generateBestSupportAlignedLayoutForOrientation(
+    slabGeometry,
+    supportAlignedSettings(settings, "vertical"),
+    zoneGeometry,
+    exclusionPolygons
+  );
+
+  return vertical.rawSheetArea < horizontal.rawSheetArea ||
+    (vertical.rawSheetArea === horizontal.rawSheetArea &&
+      vertical.cutWasteArea < horizontal.cutWasteArea)
+    ? vertical
+    : horizontal;
+}
+
+function generateSupportAlignedLayout(
+  slabGeometry: SlabGeometry,
+  settings: BaseMeshSettings,
+  zoneGeometry?: Polygon,
+  exclusionPolygons: Polygon[] = []
+) {
+  return findMostEfficientLayoutDirection(
     slabGeometry,
     settings,
     zoneGeometry,
@@ -656,6 +863,256 @@ function generateLayoutForOrientation(
     stepX: candidateLayout.stepX,
     stepY: candidateLayout.stepY
   };
+}
+
+function generateSupportAlignedLayoutForOrientation(
+  slabGeometry: SlabGeometry,
+  settings: ActiveLayoutSettings,
+  zoneGeometry?: Polygon,
+  exclusionPolygons: Polygon[] = [],
+  supportAnchors: {
+    x: SupportAxisAnchor | null;
+    y: SupportAxisAnchor | null;
+  } = { x: null, y: null }
+): MeshSheetLayoutResult {
+  const placementBoundary = getMeshPlacementBoundary(slabGeometry, settings);
+  const emptyResult: MeshSheetLayoutResult = {
+    sheets: [],
+    discardedCount: 0,
+    requestedOrientation: settings.orientation,
+    selectedOrientation: settings.orientation,
+    sheetCount: 0,
+    rawSheetArea: 0,
+    visibleArea: 0,
+    cutWasteArea: 0,
+    optimizedOverlapX: supportAlignedOverlap,
+    optimizedOverlapY: supportAlignedOverlap,
+    stepX:
+      (settings.orientation === "horizontal"
+        ? standardSheetLength
+        : standardSheetWidth) - supportAlignedOverlap,
+    stepY:
+      (settings.orientation === "horizontal"
+        ? standardSheetWidth
+        : standardSheetLength) - supportAlignedOverlap
+  };
+
+  if (placementBoundary.length < 3) {
+    return emptyResult;
+  }
+
+  const layoutBoundary = zoneGeometry
+    ? intersectPolygons(placementBoundary, zoneGeometry)[0] ?? placementBoundary
+    : placementBoundary;
+
+  if (layoutBoundary.length < 3) {
+    return emptyResult;
+  }
+
+  const candidateLayout = generateSupportAlignedSheetCandidates(
+    polygonBounds(layoutBoundary),
+    settings,
+    supportAnchors
+  );
+  const holes = getOpeningExclusionPolygons(slabGeometry, settings);
+  let discardedCount = 0;
+  let visibleArea = 0;
+  const sheets = candidateLayout.candidates.flatMap<MeshSheet>((candidate) => {
+    const visiblePolygons = clipSheetToSlab(
+      candidate,
+      slabGeometry,
+      settings,
+      zoneGeometry,
+      exclusionPolygons
+    );
+
+    if (visiblePolygons.length === 0) {
+      discardedCount += 1;
+      return [];
+    }
+
+    visibleArea += polygonCollectionArea(visiblePolygons);
+
+    return {
+      id: candidate.id,
+      width: standardSheetWidth,
+      length: standardSheetLength,
+      activeWidth: candidate.activeWidth,
+      activeLength: candidate.activeLength,
+      x: candidate.x,
+      y: candidate.y,
+      orientation: settings.orientation,
+      isCut: isSheetCut(candidate, visiblePolygons),
+      visiblePolygon: visiblePolygons[0],
+      visiblePolygons,
+      diagonalSegments: createDiagonalSegments(
+        candidate,
+        visiblePolygons,
+        holes,
+        settings.originCorner
+      )
+    };
+  });
+  const rawSheetArea = sheets.length * standardSheetLength * standardSheetWidth;
+
+  return {
+    sheets,
+    discardedCount,
+    requestedOrientation: settings.orientation,
+    selectedOrientation: settings.orientation,
+    sheetCount: sheets.length,
+    rawSheetArea,
+    visibleArea,
+    cutWasteArea: Math.max(0, rawSheetArea - visibleArea),
+    optimizedOverlapX: candidateLayout.overlapX,
+    optimizedOverlapY: candidateLayout.overlapY,
+    stepX: candidateLayout.stepX,
+    stepY: candidateLayout.stepY
+  };
+}
+
+function isBetterSupportAlignedLayout(
+  candidate: MeshSheetLayoutResult,
+  current: MeshSheetLayoutResult
+) {
+  return (
+    candidate.rawSheetArea < current.rawSheetArea ||
+    (candidate.rawSheetArea === current.rawSheetArea &&
+      candidate.cutWasteArea < current.cutWasteArea) ||
+    (candidate.rawSheetArea === current.rawSheetArea &&
+      candidate.cutWasteArea === current.cutWasteArea &&
+      candidate.visibleArea > current.visibleArea)
+  );
+}
+
+function nearestLapDistance(coordinate: number, sheetStarts: number[]) {
+  if (sheetStarts.length === 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return sheetStarts.reduce(
+    (nearest, start) =>
+      Math.min(nearest, Math.abs(coordinate - (start + supportAlignedHalfOverlap))),
+    Number.POSITIVE_INFINITY
+  );
+}
+
+function axisAlignmentPenalty(anchors: SupportAxisAnchor[], sheetStarts: number[]) {
+  return anchors.reduce(
+    (sum, anchor) => sum + nearestLapDistance(anchor.coordinate, sheetStarts),
+    0
+  );
+}
+
+function supportAlignedLayoutScore(
+  slabGeometry: SlabGeometry,
+  settings: ActiveLayoutSettings,
+  supportAnchors: {
+    x: SupportAxisAnchor | null;
+    y: SupportAxisAnchor | null;
+  },
+  layoutBoundary: Polygon
+) {
+  const bounds = polygonBounds(layoutBoundary);
+  const candidateLayout = generateSupportAlignedSheetCandidates(
+    bounds,
+    settings,
+    supportAnchors
+  );
+  const verticalAxes = supportAxisAnchors(slabGeometry, "vertical");
+  const horizontalAxes = supportAxisAnchors(slabGeometry, "horizontal");
+  const xStarts = [
+    ...new Set(candidateLayout.candidates.map((candidate) => candidate.x))
+  ];
+  const yStarts = [
+    ...new Set(candidateLayout.candidates.map((candidate) => candidate.y))
+  ];
+
+  return (
+    axisAlignmentPenalty(verticalAxes, xStarts) +
+    axisAlignmentPenalty(horizontalAxes, yStarts)
+  );
+}
+
+function isBetterScoredSupportAlignedLayout(
+  candidate: {
+    alignmentPenalty: number;
+    layout: MeshSheetLayoutResult;
+  },
+  current: {
+    alignmentPenalty: number;
+    layout: MeshSheetLayoutResult;
+  }
+) {
+  return (
+    candidate.alignmentPenalty < current.alignmentPenalty ||
+    (candidate.alignmentPenalty === current.alignmentPenalty &&
+      isBetterSupportAlignedLayout(candidate.layout, current.layout))
+  );
+}
+
+function generateBestSupportAlignedLayoutForOrientation(
+  slabGeometry: SlabGeometry,
+  settings: ActiveLayoutSettings,
+  zoneGeometry?: Polygon,
+  exclusionPolygons: Polygon[] = []
+) {
+  const placementBoundary = getMeshPlacementBoundary(slabGeometry, settings);
+
+  if (placementBoundary.length < 3) {
+    return generateSupportAlignedLayoutForOrientation(
+      slabGeometry,
+      settings,
+      zoneGeometry,
+      exclusionPolygons
+    );
+  }
+
+  const layoutBoundary = zoneGeometry
+    ? intersectPolygons(placementBoundary, zoneGeometry)[0] ?? placementBoundary
+    : placementBoundary;
+
+  if (layoutBoundary.length < 3) {
+    return generateSupportAlignedLayoutForOrientation(
+      slabGeometry,
+      settings,
+      zoneGeometry,
+      exclusionPolygons
+    );
+  }
+
+  const xAnchors = supportAxisAnchors(slabGeometry, "vertical");
+  const yAnchors = supportAxisAnchors(slabGeometry, "horizontal");
+  const candidateXAnchors = xAnchors.length > 0 ? xAnchors : [null];
+  const candidateYAnchors = yAnchors.length > 0 ? yAnchors : [null];
+  const scoredLayouts = candidateXAnchors.flatMap((xAnchor) =>
+    candidateYAnchors.map((yAnchor) => {
+      const supportAnchors = { x: xAnchor, y: yAnchor };
+      const layout = generateSupportAlignedLayoutForOrientation(
+        slabGeometry,
+        settings,
+        zoneGeometry,
+        exclusionPolygons,
+        supportAnchors
+      );
+
+      return {
+        alignmentPenalty: supportAlignedLayoutScore(
+          slabGeometry,
+          settings,
+          supportAnchors,
+          layoutBoundary
+        ),
+        layout
+      };
+    })
+  );
+
+  return scoredLayouts
+    .reduce((best, candidate) =>
+      isBetterScoredSupportAlignedLayout(candidate, best) ? candidate : best
+    )
+    .layout;
 }
 
 export const generateMeshSheetLayout = generateBaseMeshLayout;
